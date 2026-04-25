@@ -1,0 +1,16 @@
+{
+  "name": "hotel-parser",
+  "version": "1.0.0",
+  "description": "Парсер отелей Booking.com и Trip.com с аналитикой",
+  "private": true,
+  "scripts": {
+    "parse": "node hotel-parser.js",
+    "parse:booking": "node hotel-parser.js --booking",
+    "parse:trip": "node hotel-parser.js --trip",
+    "report": "node build-report.js"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "playwright": "^1.44.0"
+  }
+}

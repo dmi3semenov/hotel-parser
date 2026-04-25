@@ -1,0 +1,4 @@
+node_modules/
+output/
+session/
+.DS_Store
