@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node build-report.js)",
+      "Bash(git add *)"
+    ]
+  }
+}
