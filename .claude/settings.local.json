@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(node build-report.js)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git checkout *)"
     ]
   }
 }
