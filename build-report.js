@@ -217,8 +217,21 @@ if (!fs.existsSync(latestFile)) {
 const allHotels = JSON.parse(fs.readFileSync(latestFile, 'utf8'));
 console.log(`📊 Загружено: ${allHotels.length} отелей`);
 
+// Исключаем хостелы/гестхаусы/частные комнаты — и в Excel, и на карте показываем
+// только отели/апартаменты (пользователь: «только отели»).
+const HOSTEL_RE = /хостел|hostel|дорм|dorm|гостев|guest\s*house|guesthouse|private room|room in|комнат/i;
+
+// Санити: абсурдно высокие/низкие цены — обычно склейка чисел при парсинге.
+// Считаем такие записи как «без цены», чтобы не было меток вроде «383 919 ₽».
+for (const h of allHotels) {
+  if (h.price_per_night_rub && (h.price_per_night_rub > 150000 || h.price_per_night_rub < 150)) {
+    h.price_per_night_rub = null;
+    h.price_total_rub = null;
+  }
+}
+
 const hotels = allHotels
-  .filter(h => !/хостел|hostel|дорм|dorm/i.test(h.name || ''))
+  .filter(h => !HOSTEL_RE.test(h.name || ''))
   .sort((a, b) => (a.price_per_night_rub || 999999) - (b.price_per_night_rub || 999999));
 
 // ── Config ────────────────────────────────────────────────────────────
@@ -679,7 +692,7 @@ function buildHtmlMap() {
     return ` <span style="color:${color};font-size:11px;font-weight:700;letter-spacing:1px">${stars}</span>`;
   }
 
-  const markers = allHotels.map((h, i) => {
+  const markers = hotels.map((h, i) => {
     const lat  = h.lat || (CITY_LAT + (((i * 7919) % 200) - 100) * 0.0002);
     const lng  = h.lng || (CITY_LNG + (((i * 6271) % 200) - 100) * 0.0003);
     const ppn  = h.price_per_night_rub;
@@ -837,9 +850,9 @@ ${safeVenue ? `<div style="color:#AD1457;font-size:12px;font-weight:700;margin-t
 }).bindPopup(\`${popup}\`, {maxWidth: 300, minWidth: 260}).addTo(map);`;
   }).join('\n\n');
 
-  const bCount = allHotels.filter(h => h.source === 'booking').length;
-  const tCount = allHotels.filter(h => h.source === 'trip').length;
-  const oCount = allHotels.filter(h => h.source === 'ostrovok').length;
+  const bCount = hotels.filter(h => h.source === 'booking').length;
+  const tCount = hotels.filter(h => h.source === 'trip').length;
+  const oCount = hotels.filter(h => h.source === 'ostrovok').length;
   const dateRange = `${new Date(checkin).toLocaleDateString('ru-RU')} – ${new Date(checkout).toLocaleDateString('ru-RU')}`;
 
   const html = `<!DOCTYPE html>
@@ -1015,7 +1028,7 @@ ${safeVenue ? `<div style="color:#AD1457;font-size:12px;font-weight:700;margin-t
 <div id="map"></div>
 <div id="legend">
   <h3>🏨 Отели ${CITY_NAME}</h3>
-  <div style="color:#888;font-size:11px;margin-bottom:8px">${dateRange} · ${allHotels.length} объектов</div>
+  <div style="color:#888;font-size:11px;margin-bottom:8px">${dateRange} · ${hotels.length} объектов</div>
   ${EVENTS.map(e => `<div class="leg-event clickable" data-name="${safe(e.название)}" onclick="focusItem(this.dataset.name)"><span class="ev-ic">${e.тип || '🎤'}</span><span><span class="ev-t">${safe(e.название)}</span><br><span class="ev-d">${safe(e.дата || '')}${e.место ? ' · ' + safe(e.место) : ''}</span></span></div>`).join('\n  ')}
   <div class="leg-row"><div class="leg-pin" style="background:#2E7D32">2к</div><span class="leg-label">до 3 000 ₽/н</span></div>
   <div class="leg-row"><div class="leg-pin" style="background:#F9A825">5к</div><span class="leg-label">3 000 – 7 000 ₽/н</span></div>
