@@ -79,6 +79,7 @@ async function scrapeBooking(page) {
     `&checkin=${checkin}&checkout=${checkout}`,
     `&group_adults=${adults}&no_rooms=${rooms}&group_children=0`,
     `&lang=ru&selected_currency=RUB&order=price`,
+    `&nflt=ht_id%3D204`,   // только тип «Отели» (без апартаментов/хостелов/гестхаусов)
   ].join('');
 
   console.log('\n╔══════════════════════════════════════════╗');
@@ -131,17 +132,18 @@ async function scrapeBooking(page) {
 
       // Price — find ₽ in card text
       const cardText = card.textContent;
-      // Цена: берём число из спец-элемента цены Booking; иначе — МАКСИМАЛЬНОЕ число
-      // с руб/₽ в карточке (≥500), чтобы не схватить мелкие налоги/сборы вроде «339 руб».
-      const pickPrice = (text) => {
-        const nums = [...(text || '').matchAll(/([\d][\d\s]{2,}[\d])\s*(?:₽|руб)/gi)]
+      // Booking показывает И цену за ночь («1 494 руб»), И итог («5 977 руб за 4 ночи»).
+      // Берём ИМЕННО итог за весь период — иначе код ещё раз делит на ночи и занижает в N раз.
+      const totalMatch = cardText.match(/([\d][\d\s]{2,}[\d])\s*руб\s*за\s+\d+\s+ноч/i);
+      let priceDisplay = totalMatch ? totalMatch[1].trim() + ' руб' : null;
+      if (!priceDisplay) {
+        // Фолбэк: максимальное число с руб/₽ в карточке (≥500) — обычно это итог,
+        // а не цена за ночь и не мелкие налоги/сборы.
+        const nums = [...cardText.matchAll(/([\d][\d\s]{2,}[\d])\s*(?:₽|руб)/gi)]
           .map(m => parseInt(m[1].replace(/\s/g, ''), 10))
           .filter(n => !isNaN(n) && n >= 500);
-        return nums.length ? Math.max(...nums) : null;
-      };
-      const priceEl  = card.querySelector('[data-testid="price-and-discounted-price"]');
-      const priceNum = (priceEl ? pickPrice(priceEl.textContent) : null) ?? pickPrice(cardText);
-      const priceDisplay = priceNum ? priceNum + ' руб' : null;
+        if (nums.length) priceDisplay = Math.max(...nums) + ' руб';
+      }
 
       // Stars
       const starsMatch = (card.querySelector('[aria-label*="звёзд"]')?.getAttribute('aria-label') ??
@@ -371,11 +373,14 @@ async function scrapeOstrovok(page) {
   const citySlug = config.город.slug_ostrovok || config.город.slug;
   const country  = config.город.country_ostrovok || 'russia';
 
+  // Ostrovok принимает даты в формате dates=DD.MM.YYYY-DD.MM.YYYY&guests=N.
+  // Старый date_from/date_to НЕ распознавался → вылезала модалка с дефолтными
+  // датами (6-7 июня), и парсились цены за 1 ночь не на те даты.
+  const toDM = s => s.split('-').reverse().join('.');  // 2026-06-10 → 10.06.2026
   const url = [
     `https://ostrovok.ru/hotel/${country}/${citySlug}/`,
-    `?date_from=${checkin}&date_to=${checkout}`,
-    `&adults=${adults}&rooms=${rooms}`,
-    `&sort=price`,
+    `?dates=${toDM(checkin)}-${toDM(checkout)}`,
+    `&guests=${adults}`,
   ].join('');
 
   console.log('\n╔══════════════════════════════════════════╗');
@@ -457,10 +462,15 @@ async function scrapeOstrovok(page) {
       if (!name || name.length < 3 || seen.has(name)) return null;
       seen.add(name);
 
-      // Price — RUB ₽
-      const priceMatch = allText.match(/([\d][\d\s]*[\d])\s*[₽Р]/) ||
+      // Price — RUB ₽. Приоритет: итоговая цена «N ₽ за M ночей» (а не GURU-цена
+      // по логину и не зачёркнутая «до скидки»). Иначе — первое ₽-число.
+      const totalMatch = allText.match(/([\d][\d\s]{2,}[\d])\s*₽\s*за\s+\d+\s+ноч/i);
+      const priceMatch = totalMatch ||
+                         allText.match(/([\d][\d\s]*[\d])\s*[₽Р]/) ||
                          allText.match(/([\d]{4,})\s*[₽Р]/);
-      const priceDisplay = priceMatch ? priceMatch[0].trim() : null;
+      const priceDisplay = priceMatch
+        ? (totalMatch ? totalMatch[1].trim() + ' ₽' : priceMatch[0].trim())
+        : null;
 
       // Rating
       const ratingMatch = allText.match(/\b([5-9]\.\d|[1-9]\d?\.\d|10(?:\.0)?)\b/);
