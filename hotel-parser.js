@@ -38,10 +38,10 @@ function parsePriceRub(str) {
   if (!str) return null;
   const norm = str.replace(/[  ]/g, ' ');
 
-  // RUB / ₽
-  const rubMatch = norm.match(/([\d][\d\s]{2,}[\d])\s*[₽Р]/) ||
+  // RUB / ₽ / «руб.» (Booking.ru показывает цены текстом «4 469 руб.», а не символом)
+  const rubMatch = norm.match(/([\d][\d\s]{2,}[\d])\s*(?:[₽Р]|руб)/i) ||
                    norm.match(/([₽Р])\s*([\d][\d\s]{2,}[\d])/) ||
-                   norm.match(/([\d]{4,})\s*[₽Р]/);
+                   norm.match(/([\d]{4,})\s*(?:[₽Р]|руб)/i);
   if (rubMatch) {
     const digits = (rubMatch[1] === '₽' || rubMatch[1] === 'Р') ? rubMatch[2] : rubMatch[1];
     const num = parseInt(digits.replace(/\s/g, ''), 10);
@@ -131,9 +131,17 @@ async function scrapeBooking(page) {
 
       // Price — find ₽ in card text
       const cardText = card.textContent;
-      const priceMatch = cardText.match(/([\d][\d\s]{2,}[\d])\s*₽/) ||
-                         cardText.match(/([\d]{4,})\s*₽/);
-      const priceDisplay = priceMatch ? priceMatch[0].trim() : null;
+      // Цена: берём число из спец-элемента цены Booking; иначе — МАКСИМАЛЬНОЕ число
+      // с руб/₽ в карточке (≥500), чтобы не схватить мелкие налоги/сборы вроде «339 руб».
+      const pickPrice = (text) => {
+        const nums = [...(text || '').matchAll(/([\d][\d\s]{2,}[\d])\s*(?:₽|руб)/gi)]
+          .map(m => parseInt(m[1].replace(/\s/g, ''), 10))
+          .filter(n => !isNaN(n) && n >= 500);
+        return nums.length ? Math.max(...nums) : null;
+      };
+      const priceEl  = card.querySelector('[data-testid="price-and-discounted-price"]');
+      const priceNum = (priceEl ? pickPrice(priceEl.textContent) : null) ?? pickPrice(cardText);
+      const priceDisplay = priceNum ? priceNum + ' руб' : null;
 
       // Stars
       const starsMatch = (card.querySelector('[aria-label*="звёзд"]')?.getAttribute('aria-label') ??
