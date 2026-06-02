@@ -229,6 +229,7 @@ const CITY_SLUG     = config.город.slug;
 const ATTRACTIONS   = config.достопримечательности || [];
 const PLACES        = config.интересные_места || [];
 const METRO         = config.метро || [];
+const EVENTS        = config.события || [];   // особые метки-события (концерты, матчи и т.п.)
 
 const PLACE_CATEGORIES = {
   'еда':      { цвет: '#FB8C00', фон: '#FFF3E0', label: 'Поесть/выпить' },
@@ -805,6 +806,37 @@ ${safeAddr ? `<div style="color:#777;font-size:11px;margin-top:4px">📍 ${safeA
 }).bindPopup(\`${popup}\`, {maxWidth: 300, minWidth: 260}).addTo(placesLayer);`;
   }).join('\n\n');
 
+  // ── Особые метки-события (концерты, матчи) — крупная пульсирующая метка поверх всего ──
+  const eventMarkers = EVENTS.map(e => {
+    const safeName  = safe(e.название);
+    const safeDesc  = safe(e.описание || '');
+    const safeVenue = safe(e.место || '');
+    const safeDate  = safe(e.дата || '');
+    const ic        = e.тип || '🎤';
+    const photos    = e.фото || [];
+    const slideId   = 'ev' + Math.abs(safeName.split('').reduce((h, c) => (h << 5) - h + c.charCodeAt(0), 0));
+
+    let photoHtml = '';
+    if (photos.length > 0) {
+      const imgs = photos.map((src, i) =>
+        `<img src="${src}" class="aslide${i===0?' active':''}" data-idx="${i}" loading="eager" onerror="this.onerror=null;this.src='${placeholder}'">`
+      ).join('');
+      photoHtml = `<div class="aslider" id="${slideId}" data-total="${photos.length}">${imgs}</div>`;
+    }
+    const dateBadge = safeDate
+      ? `<span style="background:#C2185B;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:8px;margin-left:6px">${safeDate}</span>`
+      : '';
+    const popup = `<div class="hpop apop">
+<b style="font-size:15px">${ic} ${safeName}</b>${dateBadge}
+${photoHtml}${safeDesc ? `<div style="color:#444;font-size:12px;line-height:1.5;margin-top:6px">${safeDesc}</div>` : ''}
+${safeVenue ? `<div style="color:#AD1457;font-size:12px;font-weight:700;margin-top:6px">📍 ${safeVenue}</div>` : ''}
+</div>`;
+    return `markerByName[${JSON.stringify(e.название)}] = L.marker([${e.lat}, ${e.lng}], {
+  zIndexOffset: 2000,
+  icon: L.divIcon({ className: '', html: '<div class="epin">${ic}</div>', iconSize: [50, 50], iconAnchor: [25, 25], popupAnchor: [0, -30] })
+}).bindPopup(\`${popup}\`, {maxWidth: 300, minWidth: 260}).addTo(map);`;
+  }).join('\n\n');
+
   const bCount = allHotels.filter(h => h.source === 'booking').length;
   const tCount = allHotels.filter(h => h.source === 'trip').length;
   const oCount = allHotels.filter(h => h.source === 'ostrovok').length;
@@ -818,6 +850,10 @@ ${safeAddr ? `<div style="color:#777;font-size:11px;margin-top:4px">📍 ${safeA
 <title>Отели ${CITY_NAME} — карта</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- MapLibre GL + плагин для Leaflet: векторная подложка OpenFreeMap с русскими подписями -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.22/leaflet-maplibre-gl.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -871,6 +907,33 @@ ${safeAddr ? `<div style="color:#777;font-size:11px;margin-top:4px">📍 ${safeA
   }
   .ppin:hover { transform: scale(1.25); z-index: 1000; }
   .ppop { font-family: -apple-system, sans-serif; font-size: 13px; min-width: 240px; line-height: 1.5; }
+
+  /* Особая метка-событие (концерт и т.п.) — крупная, пульсирующая */
+  .epin {
+    font-size: 24px; width: 50px; height: 50px;
+    background: radial-gradient(circle at 50% 38%, #FF4081, #C2185B);
+    color: #fff; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    border: 3px solid #fff;
+    box-shadow: 0 0 0 4px rgba(233,30,99,.45), 0 4px 14px rgba(0,0,0,.55);
+    cursor: pointer; animation: epulse 1.6s infinite;
+  }
+  .epin:hover { transform: scale(1.12); }
+  @keyframes epulse {
+    0%   { box-shadow: 0 0 0 0   rgba(233,30,99,.55), 0 4px 14px rgba(0,0,0,.55); }
+    70%  { box-shadow: 0 0 0 20px rgba(233,30,99,0),  0 4px 14px rgba(0,0,0,.55); }
+    100% { box-shadow: 0 0 0 0   rgba(233,30,99,0),  0 4px 14px rgba(0,0,0,.55); }
+  }
+  .leg-event {
+    display: flex; align-items: center; gap: 8px;
+    background: linear-gradient(90deg,#FCE4EC,#F8BBD0);
+    border: 1px solid #F48FB1; border-radius: 9px;
+    padding: 7px 9px; margin: 8px 0; cursor: pointer;
+  }
+  .leg-event:hover { background: #F8BBD0; }
+  .leg-event .ev-ic { font-size: 18px; }
+  .leg-event .ev-t  { font-size: 12px; font-weight: 700; color: #AD1457; line-height: 1.25; }
+  .leg-event .ev-d  { font-size: 10px; color: #880E4F; }
 
   .hpop { font-family: -apple-system, sans-serif; font-size: 13px; min-width: 220px; line-height: 1.5; }
   .apop { min-width: 260px; }
@@ -953,6 +1016,7 @@ ${safeAddr ? `<div style="color:#777;font-size:11px;margin-top:4px">📍 ${safeA
 <div id="legend">
   <h3>🏨 Отели ${CITY_NAME}</h3>
   <div style="color:#888;font-size:11px;margin-bottom:8px">${dateRange} · ${allHotels.length} объектов</div>
+  ${EVENTS.map(e => `<div class="leg-event clickable" data-name="${safe(e.название)}" onclick="focusItem(this.dataset.name)"><span class="ev-ic">${e.тип || '🎤'}</span><span><span class="ev-t">${safe(e.название)}</span><br><span class="ev-d">${safe(e.дата || '')}${e.место ? ' · ' + safe(e.место) : ''}</span></span></div>`).join('\n  ')}
   <div class="leg-row"><div class="leg-pin" style="background:#2E7D32">2к</div><span class="leg-label">до 3 000 ₽/н</span></div>
   <div class="leg-row"><div class="leg-pin" style="background:#F9A825">5к</div><span class="leg-label">3 000 – 7 000 ₽/н</span></div>
   <div class="leg-row"><div class="leg-pin" style="background:#E65100">10к</div><span class="leg-label">7 000 – 15 000 ₽/н</span></div>
@@ -982,10 +1046,38 @@ ${safeAddr ? `<div style="color:#777;font-size:11px;margin-top:4px">📍 ${safeA
 </div>
 <script>
 const map = L.map('map').setView([${CITY_LAT}, ${CITY_LNG}], 13);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/">CARTO</a>',
+
+// Растровый CARTO — базовый фолбэк (показывается, пока/если векторный слой недоступен).
+const cartoBase = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/">CARTO</a> · подписи: OpenFreeMap',
   maxZoom: 19, subdomains: 'abcd'
 }).addTo(map);
+
+// Векторный OpenFreeMap (без API-ключа) с принудительно русскими подписями.
+// Работает для любого города: text-field → name:ru, фолбэк name:en, затем локальное name.
+try {
+  if (L.maplibreGL) {
+    const glLayer = L.maplibreGL({ style: 'https://tiles.openfreemap.org/styles/liberty' }).addTo(map);
+    const mlMap = glLayer.getMaplibreMap();
+    let ruApplied = false;
+    const applyRussianLabels = () => {
+      if (ruApplied || !mlMap.isStyleLoaded()) return;
+      const layers = (mlMap.getStyle().layers) || [];
+      for (const ly of layers) {
+        if (ly.type === 'symbol' && ly.layout && ('text-field' in ly.layout)) {
+          try {
+            mlMap.setLayoutProperty(ly.id, 'text-field',
+              ['coalesce', ['get', 'name:ru'], ['get', 'name:en'], ['get', 'name']]);
+          } catch (e) {}
+        }
+      }
+      ruApplied = true;
+      if (map.hasLayer(cartoBase)) map.removeLayer(cartoBase); // векторный слой готов — убираем растровый фолбэк
+    };
+    mlMap.on('load', applyRussianLabels);
+    mlMap.on('styledata', applyRussianLabels);
+  }
+} catch (e) { /* MapLibre недоступен — остаёмся на CARTO */ }
 
 ${markers}
 
@@ -995,6 +1087,9 @@ ${attractionMarkers}
 
 const placesLayer = L.layerGroup().addTo(map);
 ${placesMarkers}
+
+// Особые метки-события (концерты и т.п.) — добавляются прямо на карту, всегда поверх
+${eventMarkers}
 
 const metroLayer = L.layerGroup().addTo(map);
 
