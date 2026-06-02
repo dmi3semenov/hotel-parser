@@ -8,7 +8,11 @@ const path    = require('path');
 // ── Geocoding (Nominatim) ─────────────────────────────────────────────
 function geocodeRequest(query) {
   return new Promise(resolve => {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&countrycodes=by`;
+    // Код страны для фильтра Nominatim берём из конфига (config.город.geocode_countrycodes:
+    // 'by' для Минска, 'ge' для Тбилиси и т.д.). Без него фильтр по стране не применяется.
+    const cc = config.город.geocode_countrycodes;
+    const ccParam = cc ? `&countrycodes=${cc}` : '';
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1${ccParam}`;
     https.get(url, { headers: { 'User-Agent': 'hotel-parser/1.0 (educational)' } }, res => {
       let data = '';
       res.on('data', c => data += c);
