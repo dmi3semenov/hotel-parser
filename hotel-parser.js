@@ -9,10 +9,25 @@ const args = process.argv.slice(2);
 const ONLY_BOOKING  = args.includes('--booking');
 const ONLY_TRIP     = args.includes('--trip');
 const ONLY_OSTROVOK = args.includes('--ostrovok');
-const runAll        = !ONLY_BOOKING && !ONLY_TRIP && !ONLY_OSTROVOK;
+const ONLY_AGODA    = args.includes('--agoda');
+const runAll        = !ONLY_BOOKING && !ONLY_TRIP && !ONLY_OSTROVOK && !ONLY_AGODA;
 const runBooking    = ONLY_BOOKING  || runAll;
 const runTrip       = ONLY_TRIP     || runAll;
 const runOstrovok   = ONLY_OSTROVOK || runAll;
+const runAgoda      = ONLY_AGODA    || runAll;
+
+// Сколько страниц выдачи проходить. Без флага число берётся со страницы
+// («Стр. 1 из 10»), а не зашивается: для другого города оно другое.
+const pagesArg = args.find(a => a.startsWith('--agoda-pages='));
+const AGODA_MAX_PAGES = pagesArg ? (parseInt(pagesArg.split('=')[1], 10) || 0) : 0;
+
+// Островок: по 20 карточек на страницу, листается кнопкой «Вперед».
+// По умолчанию идём до конца — цикл сам остановится, когда кнопка «Вперед»
+// пропадёт. 200 здесь не потолок выгрузки, а предохранитель от бесконечного
+// цикла: с прежним значением 15 выгрузка молча обрывалась на 297 отелях.
+const oPagesArg = args.find(a => a.startsWith('--ostrovok-pages='));
+const OSTROVOK_MAX_PAGES = oPagesArg
+  ? (parseInt(oPagesArg.split('=')[1], 10) || 200) : 200;
 
 const { заезд: checkin, выезд: checkout } = config.даты;
 const nights = Math.round((new Date(checkout) - new Date(checkin)) / 86400000);
@@ -37,6 +52,15 @@ const USD_TO_RUB = 90;
 function parsePriceRub(str) {
   if (!str) return null;
   const norm = str.replace(/[  ]/g, ' ');
+
+  // Trip.com печатает КОД валюты перед числом и запятую в разрядах:
+  // «Total price: RUB 14,027». Ни один шаблон ниже такого не ловил —
+  // из-за этого у Trip.com цена не снималась вообще (12 отелей, 0 цен).
+  const rubCode = norm.match(/RUB\s*([\d][\d,\s]*\d)/i);
+  if (rubCode) {
+    const num = parseInt(rubCode[1].replace(/[,\s]/g, ''), 10);
+    if (!isNaN(num) && num >= 100 && num <= 2000000) return num;
+  }
 
   // RUB / ₽ / «руб.» (Booking.ru показывает цены текстом «4 469 руб.», а не символом)
   const rubMatch = norm.match(/([\d][\d\s]{2,}[\d])\s*(?:[₽Р]|руб)/i) ||
@@ -67,6 +91,67 @@ async function scrollPage(page, times = 10, delayMs = 800) {
     await wait(delayMs);
   }
   await wait(2000);
+}
+
+// Залогинен ли пользователь. Цены с уровнем лояльности (Genius, GURU,
+// Trip Rewards, Agoda VIP) отличаются от анонимных, поэтому состояние входа
+// надо не предполагать, а печатать в лог каждого прогона.
+// Вход засчитываем ТОЛЬКО по положительному признаку: отсутствие кнопки
+// «Войти» ещё ничего не значит — её может просто не быть в этой вёрстке.
+async function logLoginState(page, label) {
+  try {
+    const r = await page.evaluate(() => {
+      const acc = ['[data-selenium="user-avatar"]', '[data-element-name="user-avatar"]',
+        '[data-testid="header-avatar"]', '[data-testid="avatar"]',
+        '[class*="Avatar" i]', '[class*="userMenu" i]', '[class*="ProfileButton" i]']
+        .filter(s => { try { return document.querySelector(s); } catch { return false; } });
+      const txt = (document.body.innerText || '');
+      const signIn = [...document.querySelectorAll('button,a,span')]
+        .map(e => (e.innerText || '').trim())
+        .filter(t => t && t.length < 28
+          && /^(войти|вход|зарегистрироваться|создать аккаунт|sign in|register|log in)$/i.test(t));
+      const member = /genius|мои бронирования|мой аккаунт|мои поездки|личный кабинет|уровень|бонусны|agodacash|trip coins/i
+        .test(txt.slice(0, 6000));
+      return { acc, signIn: [...new Set(signIn)].slice(0, 3), member };
+    });
+    // Кнопка «Войти» на странице — надёжный признак, что НЕ вошёл.
+    // Её отсутствие — слабый признак обратного: у Booking и Островка
+    // узел аватара называется не так, как в списке выше, и acc там 0
+    // даже у залогиненного пользователя.
+    const verdict = r.signIn.length ? 'НЕ вошёл'
+      : (r.acc.length || r.member) ? 'вошёл'
+      : 'скорее вошёл (кнопок входа нет)';
+    console.log(`🔑 ${label}: ${verdict}`
+      + `  [аккаунт-узлы: ${r.acc.length || '—'}, кнопки входа: ${r.signIn.join('/') || '—'}`
+      + `, признаки кабинета: ${r.member ? 'есть' : 'нет'}]`);
+  } catch (e) {
+    console.log(`🔑 ${label}: проверить не удалось (${e.message.split('\n')[0].slice(0, 50)})`);
+  }
+}
+
+// Booking и Островок отдают первую порцию карточек, а остальное прячут за
+// кнопкой «Показать ещё». Фиксированного числа прокруток не хватает: раньше
+// из-за этого выходило 73 отеля у Booking и 20 у Островка вместо всей выдачи.
+// Крутим вниз и жмём кнопку, пока карточки прибавляются.
+async function loadAllResults(page, cardSelector, buttonLabels, maxRounds = 45) {
+  const sel = buttonLabels.map(l => `button:has-text("${l}"), a:has-text("${l}")`).join(', ');
+  let last = 0, stale = 0;
+  for (let i = 0; i < maxRounds && stale < 3; i++) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await wait(1600);
+
+    const btn = page.locator(sel).first();
+    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await btn.click().catch(() => {});
+      await wait(3000);
+    }
+
+    const n = await page.locator(cardSelector).count().catch(() => 0);
+    if (n <= last) stale++; else { stale = 0; last = n; }
+    if (i % 4 === 0) console.log(`   ...карточек на странице: ${n}`);
+  }
+  console.log(`   итого карточек в DOM: ${last}`);
+  return last;
 }
 
 // ── BOOKING.COM ───────────────────────────────────────────────────────
@@ -108,8 +193,15 @@ async function scrapeBooking(page) {
     }
   }
 
+  await logLoginState(page, 'Booking.com');
+
   console.log('📜 Прокручиваю страницу для подгрузки всех результатов...');
-  await scrollPage(page, 10, 800);
+  // Кнопка называется «Загрузить больше результатов» — именно она, а не
+  // «Показать ещё». В фильтрах слева Booking сам пишет «Отели 258», так что
+  // 75 в выгрузке означало, что до кнопки просто не дожали.
+  await loadAllResults(page, '[data-testid="property-card"]',
+    ['Загрузить больше результатов', 'Загрузить ещё результаты',
+     'Показать ещё результаты', 'Load more results']);
   await page.screenshot({ path: path.join(outDir, 'booking_screenshot.png') });
 
   const raw = await page.evaluate(() => {
@@ -203,6 +295,84 @@ async function scrapeBooking(page) {
 
 // ── TRIP.COM ──────────────────────────────────────────────────────────
 
+// Селекторы сняты с живой выдачи 13.08.2026, не угаданы.
+//
+// Старый код перебирал предполагаемые классы ([class*="hotel-item"] и т.п.),
+// ни один не совпадал, и срабатывал generic-фолбэк по [class*="item"] —
+// отсюда склеенные имена вроде «Autumn Sea Boutique HotelNew to Trip.com».
+// Настоящая карточка — div.hotel-card-versionb, её id это id отеля.
+//
+// Цену не брал ни один шаблон: Trip печатает код валюты ПЕРЕД числом и с
+// запятой в разрядах — «RUB 4,717», а в коде были только «N ₽» и «N USD».
+const TRIP_CARD = 'div.hotel-card-versionb';
+
+// Trip подгружает партиями и плохо реагирует на рывки — крутим мягко
+async function tripScrollAll(page) {
+  let last = 0, stale = 0;
+  for (let i = 0; i < 40 && stale < 5; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.8));
+    await wait(1600);
+    const n = await page.locator(TRIP_CARD).count().catch(() => 0);
+    if (n <= last) stale++; else { stale = 0; last = n; }
+  }
+  await wait(3000);
+  console.log(`   карточек в DOM: ${last}`);
+  return last;
+}
+
+// Исполняется в странице. Не должна ссылаться на внешние переменные.
+function tripExtract() {
+  const money = s => {
+    const m = String(s || '').match(/RUB\s*([\d][\d,\s]*\d)/i);
+    if (!m) return null;
+    const v = parseInt(m[1].replace(/[,\s]/g, ''), 10);
+    return isNaN(v) ? null : v;
+  };
+  const int = s => {
+    const m = String(s || '').match(/(\d[\d,\s]*)/);
+    if (!m) return null;
+    const v = parseInt(m[1].replace(/[,\s]/g, ''), 10);
+    return isNaN(v) ? null : v;
+  };
+
+  return [...document.querySelectorAll('div.hotel-card-versionb')].map(card => {
+    const q = s => card.querySelector(s);
+    const t = s => q(s)?.textContent?.trim() || null;
+
+    const name = t('a.hotelName');
+    if (!name) return null;
+
+    // «Total price: RUB 16,048 / 1 room × 3 nights incl. taxes & fees»
+    const explain = t('div.price-explain-versionb') || '';
+    const nightsM = explain.match(/(\d+)\s*night/i);
+
+    // В price-line-versionb два числа: до скидки и со скидкой.
+    // Последнее — то, что показано крупно.
+    const line = [...card.querySelectorAll('div.price-line-versionb span')]
+      .map(s => money(s.textContent)).filter(v => v != null);
+
+    const starN = card.querySelectorAll('[class*="star-item"], [class*="starItem"]').length;
+
+    return {
+      hotel_id: card.id || null,
+      name,
+      total_rub: money(t('span.price-highlight')) || money(explain),
+      per_night_rub: line.length ? line[line.length - 1] : null,
+      covers_nights: nightsM ? parseInt(nightsM[1], 10) : null,
+      price_line: t('div.price-line-versionb'),
+      rating: parseFloat((t('span.score') || '').replace(',', '.')) || null,
+      rating_label: t('span.comment-desc-versionb'),
+      review_count: int(t('span.comment-num')),
+      stars: starN >= 1 && starN <= 5 ? starN : null,
+      address: [...card.querySelectorAll('span.position-desc')]
+        .map(e => e.textContent.trim()).filter(Boolean).join(', ') || null,
+      room: t('div.room-name'),
+      url: q('a.hotelName')?.href || q('a')?.href || null,
+      thumbnail: q('img')?.src || null,
+    };
+  }).filter(Boolean);
+}
+
 async function scrapeTrip(page) {
   const { взрослых: adults, номеров: rooms } = config.гости;
 
@@ -210,26 +380,65 @@ async function scrapeTrip(page) {
   const cin  = checkin.replace(/-/g, '');
   const cout = checkout.replace(/-/g, '');
 
-  const cityParam = config.город.cityid_trip
-    ? config.город.cityid_trip
-    : encodeURIComponent(config.город.query_trip);
-
-  const url = [
-    'https://www.trip.com/hotels/list',
-    `?city=${cityParam}`,
-    `&checkin=${cin}&checkout=${cout}`,
-    `&adult=${adults}&children=0&rooms=${rooms}`,
-    `&curr=USD&sortType=4`,
-  ].join('');
-
   console.log('\n╔══════════════════════════════════════════╗');
   console.log('║  TRIP.COM                                ║');
   console.log('╚══════════════════════════════════════════╝');
-  console.log(`URL: ${url}\n`);
-  console.log('⏳ Открываю страницу... Жду 35 секунд.\n');
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-  await wait(5000);
+  if (config.город.cityid_trip) {
+    // Числовой id есть — идём прямым URL, это быстрее и надёжнее
+    // Параметр называется cityId, а не city: со старым city=<id> Trip.com
+    // молча отдаёт пустую выдачу. Id смотрится в URL после ручного поиска.
+    const url = [
+      'https://www.trip.com/hotels/list',
+      `?cityId=${config.город.cityid_trip}`,
+      `&checkin=${cin}&checkout=${cout}`,
+      `&adult=${adults}&children=0&rooms=${rooms}`,
+      `&curr=RUB&locale=ru-RU&sortType=4`,
+    ].join('');
+    console.log(`URL: ${url}\n⏳ Открываю страницу...\n`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await wait(5000);
+  } else {
+    // Без id параметр city=<текст> Trip.com не понимает и отдаёт пустую выдачу,
+    // а их API поиска городов закрыт (403/405). Поэтому ищем как человек:
+    // печатаем город в поле, берём первую подсказку, кликаем даты в календаре.
+    console.log('Ищу через интерфейс: cityid_trip в конфиге не задан.\n');
+    await page.goto('https://www.trip.com/hotels/?locale=ru-RU&curr=RUB', {
+      waitUntil: 'domcontentloaded', timeout: 90000,
+    });
+    await wait(8000);
+
+    // Реальные id на trip.com/hotels: destinationInput, checkInInput, checkOutInput
+    const box = page.locator(
+      '#destinationInput, #hotels-destination, [data-testid="destination-input"], '
+      + 'input[placeholder*="Where"], input[placeholder*="аправлен"]').first();
+    await box.click({ timeout: 25000 });
+    await box.fill(config.город.query_trip || config.город.название);
+    await wait(3500);
+    await page.keyboard.press('ArrowDown').catch(() => {});
+    await page.keyboard.press('Enter').catch(() => {});
+    await wait(3000);
+
+    for (const [inputSel, d] of [['#checkInInput', checkin], ['#checkOutInput', checkout]]) {
+      await page.locator(inputSel).first().click({ timeout: 8000 }).catch(() => {});
+      await wait(1500);
+      const cell = page.locator(
+        `[data-date="${d}"], td[data-date="${d}"], [aria-label*="${d}"]`).first();
+      if (await cell.isVisible({ timeout: 6000 }).catch(() => false)) {
+        await cell.click().catch(() => {});
+        await wait(1200);
+      } else {
+        console.log(`   ⚠️  день ${d} в календаре не найден`);
+      }
+    }
+
+    const search = page.locator(
+      '[data-testid="search-button"], button:has-text("Найти"), '
+      + 'button:has-text("Search")').first();
+    await search.click({ timeout: 15000 }).catch(() => {});
+    console.log('⏳ Жду выдачу...\n');
+    await wait(20000);
+  }
 
   // If redirected to login page — wait up to 120 sec for the user to log in
   if (page.url().includes('/account/signin')) {
@@ -257,85 +466,15 @@ async function scrapeTrip(page) {
     }
   }
 
+  await logLoginState(page, 'Trip.com');
+
   console.log('📜 Прокручиваю страницу (ищу все отели)...');
-  await scrollPage(page, 20, 1200);
+  await tripScrollAll(page);
   await page.screenshot({ path: path.join(outDir, 'trip_screenshot.png') });
 
-  const currentUrl = page.url();
-  console.log(`Текущий URL: ${currentUrl}`);
+  console.log(`Текущий URL: ${page.url()}`);
 
-  const raw = await page.evaluate(() => {
-    // Try known Trip.com selectors (they change over time — we try several)
-    const CARD_SELECTORS = [
-      '[data-testid="hotel-card"]',
-      '[class*="hotel-item"]',
-      '[class*="hotelItem"]',
-      '[class*="HotelItem"]',
-      '[class*="property-item"]',
-      '.hotel_card',
-      '.hotel-list-item',
-    ];
-
-    let cards = [];
-    for (const sel of CARD_SELECTORS) {
-      const found = [...document.querySelectorAll(sel)];
-      if (found.length > 2) { cards = found; break; }
-    }
-
-    if (cards.length === 0) {
-      // Generic fallback: find list container and grab its direct children
-      const listEl = document.querySelector(
-        '[class*="hotel-list"], [class*="hotelList"], [class*="list-container"], [class*="ListWrapper"]'
-      );
-      if (listEl) {
-        cards = [...listEl.querySelectorAll('li, article, [class*="item"]')]
-          .filter(el => el.textContent.length > 80);
-      }
-    }
-
-    return cards.map(card => {
-      const allText = card.textContent;
-
-      // Name
-      const nameEl = card.querySelector('h2, h3, [class*="name"], [class*="Name"], [class*="title"], [class*="Title"]');
-      const name = nameEl?.textContent?.trim() ?? null;
-      if (!name || name.length < 3) return null;
-
-      // Price — RUB (₽), USD ($), EUR (€), BYN
-      const priceMatch = allText.match(/([\d][\d\s,]*[\d])\s*[₽Р]/) ||
-                         allText.match(/([\d]{4,})\s*[₽Р]/) ||
-                         allText.match(/\$\s*([\d][\d,]*[\d])/) ||
-                         allText.match(/([\d][\d,]*)\s*USD/) ||
-                         allText.match(/([\d][\d,]*)\s*BYN/) ||
-                         allText.match(/€\s*([\d][\d,]*[\d])/);
-      const priceDisplay = priceMatch ? priceMatch[0].trim() : null;
-
-      // Rating — number like 8.5 or 4.2
-      const ratingMatch = allText.match(/\b([5-9]\.\d|[1-9]\d?\.\d)\b/) ||
-                          allText.match(/\b(10\.0|10)\b/);
-      const rating = ratingMatch ? parseFloat(ratingMatch[0]) : null;
-
-      // Reviews
-      const reviewMatch = allText.match(/(\d+)\s*(отзыв|review|оценк)/i);
-      const reviewCount = reviewMatch ? parseInt(reviewMatch[1]) : null;
-
-      // Stars — count star SVG icons or look for Xзв / Xstar
-      const starIcons = card.querySelectorAll('[class*="star"], [class*="Star"]');
-      const starsFromText = allText.match(/(\d)\s*звезд/i);
-      const stars = starsFromText ? parseInt(starsFromText[1]) :
-                    (starIcons.length >= 2 && starIcons.length <= 5 ? starIcons.length : null);
-
-      // Address / distance — avoid [class*="desc"] which matches rating labels
-      const addrEl = card.querySelector('[class*="address"], [class*="location"], [class*="dist"]');
-      const address = addrEl?.textContent?.trim() ?? null;
-
-      const url = card.querySelector('a')?.href ?? null;
-      const img = card.querySelector('img')?.src ?? null;
-
-      return { name, price_display: priceDisplay, rating, review_count: reviewCount,
-               stars, address, url, thumbnail: img };
-    }).filter(Boolean);
-  });
+  const raw = await page.evaluate(tripExtract);
 
   console.log(`\n✅ Trip.com: найдено ${raw.length} карточек`);
   if (raw.length === 0) {
@@ -343,30 +482,70 @@ async function scrapeTrip(page) {
     console.log('   Возможно, Trip.com перенаправил на другую страницу или изменил DOM.');
   }
 
+  let saved = 0, noPrice = 0;
   for (const h of raw) {
-    const totalRub = parsePriceRub(h.price_display);
+    // «Total price: RUB 16 048» при «1 room × 3 nights incl. taxes & fees» —
+    // это цена за ВЕСЬ период с налогами и сборами. Остальные источники тоже
+    // хранят период, поэтому берём именно её, а не ставку×nights:
+    // 4 717 × 3 = 14 151, а реальный итог 16 048 — разница в налогах.
+    let total = h.total_rub;
+    if (total && h.covers_nights && h.covers_nights !== nights) {
+      // Подпись обещает другое число ночей — приводим к нашему
+      total = Math.round(total / h.covers_nights * nights);
+    }
+    if (!total && h.per_night_rub) total = h.per_night_rub * nights;
+    if (!total) { noPrice++; continue; }
+
     saveHotel({
       source: 'trip',
       name: h.name,
       stars: h.stars,
       rating: h.rating,
-      rating_label: null,
+      rating_label: h.rating_label,
       review_count: h.review_count,
-      price_display: h.price_display,
-      price_total_rub: totalRub,
-      price_per_night_rub: totalRub ? Math.round(totalRub / nights) : null,
+      price_display: h.price_line || `RUB ${total.toLocaleString('ru-RU')}`,
+      price_total_rub: total,
+      price_per_night_rub: Math.round(total / nights),
       nights,
       address: h.address,
       distance_text: null,
+      room: h.room,
       lat: null,
       lng: null,
       url: h.url,
       thumbnail: h.thumbnail,
     });
+    saved++;
   }
+  console.log(`   сохранено ${saved}, без цены ${noPrice}`);
 }
 
 // ── OSTROVOK.RU ───────────────────────────────────────────────────────
+
+// Перелистывание кнопкой «Вперед». Ждём смены первой карточки, иначе
+// соберём ту же страницу второй раз.
+async function ostrovokNextPage(page) {
+  const btn = page.locator('button[data-testid="next-pagination-button"]').first();
+  if (!await btn.isVisible({ timeout: 5000 }).catch(() => false)) return false;
+  if (await btn.isDisabled().catch(() => false)) return false;
+
+  // Смену страницы ловим по параметру page= в URL, а не по заголовку первой
+  // карточки: заголовок не всегда лежит в h2/h3, из-за чего проверка молча
+  // не срабатывала и парсер решал, что страницы кончились, уже стоя на page=2.
+  const pageNo = () => {
+    const m = page.url().match(/[?&]page=(\d+)/);
+    return m ? parseInt(m[1], 10) : 1;
+  };
+
+  const before = pageNo();
+  await btn.click().catch(() => {});
+
+  for (let i = 0; i < 25; i++) {
+    await wait(1000);
+    if (pageNo() !== before) { await wait(4000); return true; }
+  }
+  return false;
+}
 
 async function scrapeOstrovok(page) {
   const { взрослых: adults, номеров: rooms } = config.гости;
@@ -431,14 +610,32 @@ async function scrapeOstrovok(page) {
     }
   }
 
-  console.log('📜 Прокручиваю страницу...');
-  await scrollPage(page, 18, 1000);
+  await logLoginState(page, 'Ostrovok.ru');
+
+  console.log('📜 Собираю выдачу постранично...');
+
+  // Островок отдаёт по 20 карточек на страницу и перелистывается кнопкой
+  // «Вперед» (button[data-testid="next-pagination-button"]), а не подгрузкой
+  // по скроллу — из-за этого в выгрузке стабильно было ровно 20 отелей.
+  const bag = new Map();
+  for (let p = 1; p <= OSTROVOK_MAX_PAGES; p++) {
+    await scrollPage(page, 8, 900);
+    const batch = await page.evaluate(ostrovokExtract).catch(() => []);
+    for (const c of batch) if (!bag.has(c.name)) bag.set(c.name, c);
+    console.log(`   стр. ${p}: +${batch.length}, всего ${bag.size}`);
+    if (p >= OSTROVOK_MAX_PAGES) {
+      console.log(`   ⏹  упёрлись в предохранитель --ostrovok-pages=${OSTROVOK_MAX_PAGES},`
+        + ' выдача может быть неполной');
+      break;
+    }
+    if (!await ostrovokNextPage(page)) { console.log('   ⏹  страницы кончились'); break; }
+  }
+
   await page.screenshot({ path: path.join(outDir, 'ostrovok_screenshot.png') });
+  console.log(`Текущий URL: ${page.url()}`);
+  const raw = [...bag.values()];
 
-  const currentUrl = page.url();
-  console.log(`Текущий URL: ${currentUrl}`);
-
-  const raw = await page.evaluate(() => {
+  function ostrovokExtract() {
     // Ostrovok uses CSS module classes like HotelCard_container__xxx
     let cards = [...document.querySelectorAll('[class*="HotelCard_container"]')];
 
@@ -497,7 +694,7 @@ async function scrapeOstrovok(page) {
       return { name, price_display: priceDisplay, rating, review_count: reviewCount,
                stars, address, url, thumbnail: img };
     }).filter(Boolean);
-  });
+  }
 
   console.log(`\n✅ Ostrovok.ru: найдено ${raw.length} карточек`);
   if (raw.length === 0) {
@@ -527,7 +724,278 @@ async function scrapeOstrovok(page) {
   }
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────
+// ── AGODA.COM ─────────────────────────────────────────────────────────
+
+// Селекторы сняты с живой выдачи 13.08.2026, не угаданы.
+//
+// ГЛАВНОЕ: цену берём ТОЛЬКО из отдельного числового узла display-price.
+// Регэксп по тексту карточки брал первое ₽-число, а первым в блоке
+// property-card-price идёт бейдж «С учетом 2 039 ₽» — это РАЗМЕР СКИДКИ
+// (consolidated-applied-discount-badge), а не цена. Из-за этого в выгрузку
+// попадали 2 039 ₽ за ultra-all-inclusive вместо настоящих 22 748 ₽.
+// Второй кандидат из старого кода, fpc-cor-price, — это зачёркнутая цена
+// ДО скидки, тоже не то.
+const AGODA_CARD = '[data-selenium="hotel-item"]';
+
+// Исполняется в странице. Не должна ссылаться на внешние переменные.
+function agodaExtract() {
+  const num = s => {
+    if (!s) return null;
+    const m = String(s).replace(/[    ]/g, ' ').match(/(\d[\d\s]*)/);
+    if (!m) return null;
+    const v = parseInt(m[1].replace(/\s/g, ''), 10);
+    return isNaN(v) ? null : v;
+  };
+
+  return [...document.querySelectorAll('[data-selenium="hotel-item"]')].map(n => {
+    const q = s => n.querySelector(s);
+    const t = s => q(s)?.textContent?.trim() || null;
+
+    const name = t('[data-selenium="hotel-name"]');
+    if (!name) return null;
+
+    // display-price — чистое число, hotel-currency — символ отдельным узлом
+    let price = num(t('[data-element-name="display-price"]'));
+    if (price === null) price = num(t('[data-element-name="final-price"]'));
+    if (price === null) {
+      price = num(q('[data-element-name="fpc-room-price"]')?.getAttribute('data-fpc-value'));
+    }
+
+    // Подпись сама говорит, за что цена («За ночь после налогов и сборов»).
+    // Читаем её, а не предполагаем период.
+    const priceLabel = t('[data-element-name="per-night-begins-with"]');
+
+    // Agoda метит узлы то data-selenium, то data-element-name, то data-testid —
+    // причём один и тот же по смыслу блок в разных карточках по-разному.
+    // Ищем по значению во всех трёх: иначе половина полей молча пустая
+    // (так рейтинг, звёзды и отзывы приходили null у всех 575 отелей).
+    const byName = v => n.querySelector(`[data-selenium="${v}"]`)
+                     || n.querySelector(`[data-element-name="${v}"]`)
+                     || n.querySelector(`[data-testid="${v}"]`);
+    const tn = v => byName(v)?.textContent?.trim() || null;
+
+    // «Количество звезд: 5 из 5»
+    const starM = (tn('ssr-property-card-star-rating') || '')
+      .match(/(\d[,.]?\d?)\s*из\s*5/);
+
+    // «Средняя оценка Отлично 8,7 из 10 по 3 555 отзывам»
+    const revTxt = tn('property-card-review') || tn('ReviewWithDemographic') || '';
+    const rateM = revTxt.match(/(\d[,.]\d)\s*из\s*10/);
+    const cntM  = revTxt.match(/по\s*([\d\s  ]+?)\s*отзыв/);
+
+    // «Восточный Кам Хай, Нячанг - 20,8 км от центра»
+    const area = tn('area-city-text') || tn('area-city');
+    const distM = (area || '').match(/(\d+[,.]?\d*)\s*км от центра/);
+
+    return {
+      hotel_id: n.getAttribute('data-hotelid') || null,
+      name,
+      price,
+      currency: t('[data-element-name="hotel-currency"]'),
+      price_label: priceLabel,
+      stars:   starM ? parseFloat(starM[1].replace(',', '.')) : null,
+      rating:  rateM ? parseFloat(rateM[1].replace(',', '.')) : null,
+      reviews: cntM ? num(cntM[1]) : null,
+      area,
+      dist_km: distM ? parseFloat(distM[1].replace(',', '.')) : null,
+      is_ad: !!byName('sponsored-badge'),
+      url: q('a')?.href || null,
+      thumbnail: q('img')?.src || null,
+    };
+  }).filter(Boolean);
+}
+
+async function scrapeAgoda(page) {
+  const { взрослых: adults, номеров: rooms } = config.гости;
+
+  // Agoda не принимает поисковый URL с текстовым городом: без внутреннего
+  // cityId она сбрасывает на главную. Поэтому ведём себя как человек —
+  // печатаем город в поле, берём первую подсказку и жмём поиск.
+  console.log('\n╔══════════════════════════════════════════╗');
+  console.log('║  AGODA.COM                               ║');
+  console.log('╚══════════════════════════════════════════╝\n');
+
+  // Прямой URL с внутренним id города: календарь Agoda кликать не нужно,
+  // даты она принимает параметрами. Id берётся из URL после ручного поиска.
+  if (config.город.cityid_agoda) {
+    const url = [
+      'https://www.agoda.com/ru-ru/search',
+      `?city=${config.город.cityid_agoda}`,
+      `&checkIn=${checkin}&checkOut=${checkout}&los=${nights}`,
+      `&adults=${adults}&rooms=${rooms}`,
+      '&currency=RUB&locale=ru-ru',
+    ].join('');
+    console.log(`URL: ${url}\n⏳ Открываю, жду 30 секунд...\n`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await wait(30000);
+    await logLoginState(page, 'Agoda.com');
+    return await harvestAgoda(page);
+  }
+
+  await page.goto('https://www.agoda.com/ru-ru/', {
+    waitUntil: 'domcontentloaded', timeout: 90000,
+  });
+  await wait(6000);
+
+  for (const label of ['Разрешить все', 'Принять все', 'ОК', 'Accept All']) {
+    const b = page.locator(`button:has-text("${label}")`).first();
+    if (await b.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await b.click().catch(() => {});
+      await wait(600);
+      break;
+    }
+  }
+
+  const box = page.locator('#textInput, input[data-selenium="textInput"]').first();
+  await box.click({ timeout: 20000 });
+  await box.fill(config.город.query_trip || config.город.название);
+  await wait(3000);
+  await page.keyboard.press('ArrowDown').catch(() => {});
+  await page.keyboard.press('Enter').catch(() => {});
+  await wait(2500);
+
+  // Календарь: кликаем нужные дни по data-selenium-date="YYYY-MM-DD"
+  for (const d of [checkin, checkout]) {
+    const cell = page.locator(`[data-selenium-date="${d}"]`).first();
+    if (await cell.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await cell.click().catch(() => {});
+      await wait(1200);
+    } else {
+      console.log(`   ⚠️  день ${d} в календаре не найден`);
+    }
+  }
+
+  const search = page.locator('button[data-selenium="searchButton"], '
+    + 'button:has-text("Найти отели"), button:has-text("Поиск")').first();
+  await search.click({ timeout: 15000 }).catch(() => {});
+  console.log('⏳ Жду выдачу, 30 секунд...\n');
+  await wait(30000);
+
+  return await harvestAgoda(page);
+}
+
+// Собираем ПО ХОДУ скролла, а не один раз в конце. Agoda дорисовывает
+// карточки и цены только когда они попадают в зону видимости
+// (div[data-testid="lazy-load-component"].LazyLoad.is-visible) — поэтому
+// единственный проход в конце оставлял большинство карточек без цены.
+async function agodaHarvestVisible(page, bag) {
+  const absorb = list => {
+    for (const c of list) {
+      const key = c.hotel_id || c.name;
+      const prev = bag.get(key);
+      // Карточка с ценой всегда лучше той же карточки без цены
+      if (!prev || (prev.price == null && c.price != null)) bag.set(key, c);
+    }
+  };
+
+  let lastCount = -1, stale = 0;
+  for (let step = 0; step < 45 && stale < 4; step++) {
+    const batch = await page.evaluate(agodaExtract).catch(() => []);
+    absorb(batch);
+    if (batch.length === lastCount) stale++; else { stale = 0; lastCount = batch.length; }
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
+    await wait(1300);
+  }
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await wait(2500);
+  absorb(await page.evaluate(agodaExtract).catch(() => []));
+}
+
+// Выдача разбита на страницы («Стр. 1 из 10») — скроллом они не добираются
+async function agodaNextPage(page) {
+  const btn = page.locator('[data-selenium="pagination-next-btn"]').first();
+  if (!await btn.isVisible({ timeout: 5000 }).catch(() => false)) return false;
+  if (await btn.isDisabled().catch(() => false)) return false;
+
+  const before = await page.locator(AGODA_CARD).first()
+    .getAttribute('data-hotelid').catch(() => null);
+  await btn.click().catch(() => {});
+
+  for (let i = 0; i < 30; i++) {
+    await wait(1000);
+    const now = await page.locator(AGODA_CARD).first()
+      .getAttribute('data-hotelid').catch(() => null);
+    if (now && now !== before) { await wait(4000); return true; }
+  }
+  return false;
+}
+
+async function harvestAgoda(page) {
+  const bag = new Map();
+
+  // Сколько всего страниц — спрашиваем у самой Agoda («Стр. 1 из 10»),
+  // а не зашиваем числом: для другого города оно другое.
+  let limit = AGODA_MAX_PAGES || 40;
+
+  for (let p = 1; p <= limit; p++) {
+    const label = await page.locator('[data-selenium="pagination-text"]').first()
+      .textContent({ timeout: 5000 }).catch(() => null);
+
+    if (p === 1 && !AGODA_MAX_PAGES) {
+      const m = (label || '').match(/из\s*(\d+)/i);
+      if (m) {
+        limit = parseInt(m[1], 10);
+        console.log(`📄 Agoda сообщает: всего страниц ${limit}`);
+      }
+    }
+    console.log(`📄 Agoda, страница ${p}${label ? ` (${label.trim()})` : ''}...`);
+
+    await agodaHarvestVisible(page, bag);
+    const withPrice = [...bag.values()].filter(c => c.price != null).length;
+    console.log(`   собрано ${bag.size}, из них с ценой ${withPrice}`);
+
+    if (p >= limit) {
+      console.log(AGODA_MAX_PAGES
+        ? `   ⏹  стоп: лимит --agoda-pages=${AGODA_MAX_PAGES}`
+        : '   ⏹  прошли все страницы, что заявила Agoda');
+      break;
+    }
+    if (!await agodaNextPage(page)) { console.log('   ⏹  страницы кончились'); break; }
+  }
+
+  console.log(`\n✅ Agoda: карточек ${bag.size}`);
+
+  let saved = 0, noPrice = 0, badCurrency = 0;
+  for (const c of bag.values()) {
+    if (c.price == null) { noPrice++; continue; }
+    // Просим currency=RUB. Если пришло иное — лучше пропустить, чем
+    // записать донги в поле с рублями.
+    if (c.currency && !/[₽Р]|RUB|руб/i.test(c.currency)) { badCurrency++; continue; }
+    if (c.price < 100 || c.price > 5000000) { noPrice++; continue; }
+
+    // «За ночь после налогов и сборов» → covers = 1. Если Agoda когда-нибудь
+    // отдаст «за 3 ночи» — поделим, а не умножим вслепую на nights.
+    const m = (c.price_label || '').match(/за\s+(\d+)\s+ноч/i);
+    const covers = m ? parseInt(m[1], 10) : 1;
+    const perNight = Math.round(c.price / covers);
+
+    saveHotel({
+      source: 'agoda',
+      name: c.name,
+      stars: c.stars,
+      rating: c.rating,
+      rating_label: null,
+      review_count: c.reviews,
+      price_display: `${c.price.toLocaleString('ru-RU')} ${c.currency || '₽'}`,
+      price_total_rub: perNight * nights,
+      price_per_night_rub: perNight,
+      nights,
+      address: c.area,
+      distance_text: c.dist_km != null ? `${c.dist_km} км от центра` : null,
+      distance_center_km: c.dist_km,
+      is_ad: c.is_ad,
+      lat: null,
+      lng: null,
+      url: c.url,
+      thumbnail: c.thumbnail,
+    });
+    saved++;
+  }
+
+  console.log(`   сохранено ${saved}, без цены ${noPrice}`
+    + (badCurrency ? `, чужая валюта ${badCurrency}` : ''));
+  if (!saved) console.log('   ⚠️  цен не распознано — вёрстка могла поменяться');
+}
 
 async function main() {
   console.log('🏨  Hotel Parser');
@@ -547,9 +1015,24 @@ async function main() {
   const page = await ctx.newPage();
 
   try {
-    if (runBooking)   await scrapeBooking(page);
-    if (runTrip)      await scrapeTrip(page);
-    if (runOstrovok)  await scrapeOstrovok(page);
+    // Каждый источник в своём try: раньше падение одного обрывало весь прогон,
+    // и Agoda не запускалась из-за таймаута селектора на Trip.com.
+    const sources = [
+      [runBooking,  'Booking.com', scrapeBooking],
+      [runTrip,     'Trip.com',    scrapeTrip],
+      [runOstrovok, 'Ostrovok.ru', scrapeOstrovok],
+      [runAgoda,    'Agoda.com',   scrapeAgoda],
+    ];
+    for (const [enabled, label, fn] of sources) {
+      if (!enabled) continue;
+      try {
+        await fn(page);
+      } catch (e) {
+        if (e.message.includes('closed')) throw e;
+        console.error(`\n⚠️  ${label} не отработал: ${e.message.split('\n')[0]}`);
+        console.error('   Иду к следующему источнику.\n');
+      }
+    }
   } catch (err) {
     if (err.message.includes('closed')) {
       console.error('\n❌ Браузер был закрыт вручную. Запустите снова.');
@@ -574,6 +1057,7 @@ async function main() {
       ...(runBooking  ? ['booking']  : []),
       ...(runTrip     ? ['trip']     : []),
       ...(runOstrovok ? ['ostrovok'] : []),
+      ...(runAgoda    ? ['agoda']    : []),
     ]);
     const latestFile = path.join('output', 'latest.json');
     if (fs.existsSync(latestFile)) {
@@ -596,6 +1080,7 @@ async function main() {
   console.log(`   Booking.com:  ${hotels.filter(h => h.source === 'booking').length}`);
   console.log(`   Trip.com:     ${hotels.filter(h => h.source === 'trip').length}`);
   console.log(`   Ostrovok.ru:  ${hotels.filter(h => h.source === 'ostrovok').length}`);
+  console.log(`   Agoda.com:    ${hotels.filter(h => h.source === 'agoda').length}`);
   console.log(`   С ценой:      ${hotels.filter(h => h.price_per_night_rub).length}`);
   console.log(`\n▶  Следующий шаг: node build-report.js`);
 }
