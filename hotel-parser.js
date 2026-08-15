@@ -1490,6 +1490,11 @@ async function scrapeGoogle(page) {
     let found = 0, mism = 0, missed = 0, failed2 = 0, done2 = 0;
     for (let i = 0; i < names.length; i += GOOGLE_CONCURRENCY) {
       await Promise.all(names.slice(i, i + GOOGLE_CONCURRENCY).map(async nm => {
+        // Считаем в начале, а не в конце: ниже три ранних return, и после
+        // них счётчик не доезжал. Прогресс печатался по первым удачным
+        // находкам, а дальше проход шёл молча - со стороны неотличимо
+        // от зависшего процесса.
+        done2++;
         try {
           const ids = await googleFindEntity(page.context(), nm);
           if (!ids.length) { missed++; return; }
@@ -1521,7 +1526,6 @@ async function scrapeGoogle(page) {
           failed2++;
           if (failed2 <= 5) console.log(`   ⚠️  ${nm.slice(0, 40)}: ${e.message.split('\n')[0]}`);
         }
-        done2++;
       }));
       if (done2 % 50 < GOOGLE_CONCURRENCY || done2 === names.length) {
         console.log(`   ${String(done2).padStart(4)}/${names.length}`
