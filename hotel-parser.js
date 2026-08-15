@@ -19,13 +19,33 @@ const runOstrovok   = ONLY_OSTROVOK || runAll;
 const runAgoda      = ONLY_AGODA    || runAll;
 const runGoogle     = ONLY_GOOGLE   || runAll;
 
-// Google подгружает список порциями по 18 карточек, кнопки «следующая
-// страница» у него нет. Поэтому ограничитель здесь - число прокруток,
-// а не страниц. 120 хватает на тысячу с лишним карточек и служит
-// предохранителем от бесконечного цикла.
-const gRoundsArg = args.find(a => a.startsWith('--google-rounds='));
-const GOOGLE_MAX_ROUNDS = gRoundsArg
-  ? (parseInt(gRoundsArg.split('=')[1], 10) || 120) : 120;
+// Google отдаёт список по 18-20 карточек и листается кнопкой «Далее» внизу.
+// По умолчанию идём до конца - цикл сам остановится, когда кнопка пропадёт.
+// 200 здесь не потолок выгрузки, а предохранитель от бесконечного цикла.
+const gPagesArg = args.find(a => a.startsWith('--google-pages='));
+const GOOGLE_MAX_PAGES = gPagesArg
+  ? (parseInt(gPagesArg.split('=')[1], 10) || 200) : 200;
+
+// Второй проход: по странице каждого отеля за блоком «Все варианты».
+// Он и есть смысл источника - там лежат Traveloka, klook, Prestigia и прочие,
+// которых не парсит никто из остальных четырёх. Флаг для быстрой проверки
+// списка без него, лимит - для отладки на десятке отелей.
+const GOOGLE_OFFERS = !args.includes('--google-no-offers');
+const gLimitArg = args.find(a => a.startsWith('--google-offers-limit='));
+const GOOGLE_OFFERS_LIMIT = gLimitArg ? parseInt(gLimitArg.split('=')[1], 10) || 0 : 0;
+// Страница отеля берётся обычным GET без рендера, поэтому её можно тянуть
+// в несколько потоков. Пять - осторожная величина: одна страница приезжает
+// примерно за полторы секунды, пяти хватает на тысячу отелей за пять минут,
+// и это далеко от той нагрузки, на которой Google начинает отдавать 429.
+const gConcArg = args.find(a => a.startsWith('--google-concurrency='));
+const GOOGLE_CONCURRENCY = gConcArg ? parseInt(gConcArg.split('=')[1], 10) || 5 : 5;
+
+// Третий проход: отели, которые нашли остальные четыре источника, а в списке
+// Google их нет. Их ищем поимённо. Файл - выгрузка с другими источниками,
+// по умолчанию output/latest.json, который парсер сам и пишет.
+const gMatchArg = args.find(a => a.startsWith('--google-match='));
+const GOOGLE_MATCH_FILE = args.includes('--google-no-match') ? null
+  : (gMatchArg ? gMatchArg.split('=')[1] : path.join('output', 'latest.json'));
 
 // Сколько страниц выдачи проходить. Без флага число берётся со страницы
 // («Стр. 1 из 10»), а не зашивается: для другого города оно другое.
@@ -237,6 +257,17 @@ async function scrapeBooking(page) {
       const cardText = card.textContent;
       // Booking показывает И цену за ночь («1 494 руб»), И итог («5 977 руб за 4 ночи»).
       // Берём ИМЕННО итог за весь период — иначе код ещё раз делит на ночи и занижает в N раз.
+      // ВНИМАНИЕ: цены Booking завышены, причина не найдена. Сверка с ценами
+      // Booking, которые показывает по тем же отелям и датам Google, дала
+      // медиану отношения 1.67 при 62 совпадениях: по Larosa Hotel 16 431 ₽
+      // против 7 389 ₽, по Potique 41 581 ₽ против 29 920 ₽. У Agoda и
+      // Trip.com та же сверка даёт 1.07 и 0.99 - там всё верно.
+      // Проверенная и НЕ подтвердившаяся гипотеза: «в карточке два итога,
+      // перечёркнутый и настоящий, а match берёт первый». Итог в карточке
+      // один: выбор минимального из всех совпадений цену не изменил
+      // (Larosa как была 16 431 ₽, так и осталась). Копать дальше надо
+      // в тарифах: похоже, поиск Booking и фид Booking для Google отдают
+      // разные ставки. До выяснения столбец Booking считать завышенным.
       const totalMatch = cardText.match(/([\d][\d\s]{2,}[\d])\s*руб\s*за\s+\d+\s+ноч/i);
       let priceDisplay = totalMatch ? totalMatch[1].trim() + ' руб' : null;
       if (!priceDisplay) {
@@ -1014,16 +1045,27 @@ async function harvestAgoda(page) {
 // тех агрегаторов, которых у нас нет. Скидка на Potique в 20% нашлась именно
 // через него, у Traveloka, а Traveloka не парсит никто из остальных четырёх.
 //
-// Две особенности, из-за которых модуль не похож на соседние.
+// Три особенности, из-за которых модуль не похож на соседние.
 //
 // 1. Даты. Google игнорирует checkin/checkout в ссылке - он держит их
 //    в параметре ts, это protobuf в base64url. Собирать его с нуля нельзя,
 //    сервер отвечает 500. Рабочий приём: взять живой шаблон и подменить
 //    в нём байты дней и число ночей. Длины при этом не меняются, поэтому
 //    внутренние префиксы длин остаются валидными.
-// 2. Постраничности нет. Внизу написано «Результаты 1-18 из 1090», но кнопки
-//    «дальше» не существует: список доращивается прокруткой. Признак конца -
-//    счётчик перестал расти.
+// 2. Постраничность есть, но невидимая. Внизу списка написано «Результаты
+//    1-18 из 1091» и рядом стоит кнопка «Далее» БЕЗ подписи: текст лежит
+//    внутри span, а сама кнопка неотличима от стрелок каруселей внутри
+//    карточек - у тех такой же класс и aria-label «Далее». Отличается она
+//    тем, что у неё непустой innerText. Прокрутка колесом список не растит,
+//    поэтому раньше источник и упирался в 17 карточек.
+// 3. «Все варианты» кликом не раскрываются. Кнопка «Показать больше
+//    вариантов» лежит в контейнере нулевой высоты, Playwright до неё не
+//    доскроллит, а el.click() из evaluate не даёт ни одного запроса. Клик
+//    и не нужен: весь список партнёров приезжает с первым же GET внутри
+//    блока AF_initDataCallback({key: 'ds:1', ...}) - это тот же массив,
+//    из которого страница рисуется. Разбираем его напрямую, JS исполнять
+//    не требуется, поэтому карточку отеля берём обычным ctx.request.get
+//    за полторы секунды вместо пяти на рендер.
 
 const GOOGLE_TS_TEMPLATE =
   'CAEaOAoaEhYKCS9tLzA0NGNqdjoJTmhhIFRyYW5nGgASGhIUCgcI6g8QCBgREgcI6g8QCBgVGAQyAggBKgkKBToDUlVCGgA';
@@ -1089,8 +1131,17 @@ function googleExtract() {
     const link = n.querySelector('a[href*="/travel/"]');
     const img = n.querySelector('img');
 
+    // Идентификатор отеля у Google лежит в data-href ссылки карточки:
+    // data-href="/entity/ChkIm5GK1o2cvfVGGg0vZy8xMWZocXI0cXk4EAE". По нему
+    // открывается страница отеля со всеми предложениями партнёров, и это
+    // единственная ниточка от списка к ценам - в самой карточке их нет.
+    const ent = [...n.querySelectorAll('[data-href]')]
+      .map(a => (a.getAttribute('data-href') || '').match(/\/entity\/([A-Za-z0-9_-]+)/))
+      .find(Boolean);
+
     return {
       name,
+      entity_id: ent ? ent[1] : null,
       per_night: perNight,
       total,
       rating5: rm ? parseFloat(rm[1].replace(',', '.')) : null,
@@ -1107,13 +1158,219 @@ function googleExtract() {
 
 async function googleHarvest(page, bag) {
   const batch = await page.evaluate(googleExtract).catch(() => []);
-  for (const c of batch) if (c.name && !bag.has(c.name)) bag.set(c.name, c);
+  let added = 0;
+  for (const c of batch) {
+    // Ключ - идентификатор, а не название: у Google в одном городе полно
+    // одноимённых апартаментов, и по имени они схлопывались в одну запись.
+    const key = c.entity_id || `имя:${c.name}`;
+    if (!bag.has(key)) { bag.set(key, c); added++; }
+  }
+  return { seen: batch.length, added };
+}
+
+// Счётчик «Результаты 19-38 из 2 760» - единственный надёжный признак того,
+// что страница действительно перелистнулась: DOM Google перерисовывает
+// асинхронно, и карточки какое-то время остаются от прошлой страницы.
+async function googleCounter(page) {
+  return page.evaluate(() => {
+    const n = [...document.querySelectorAll('*')]
+      .find(e => !e.children.length && /Результаты\s*[\d\s]+[–-][\d\s]+\s*из/.test(e.textContent || ''));
+    return n ? n.textContent.replace(/\s+/g, ' ').trim() : null;
+  }).catch(() => null);
+}
+
+// Порядок сортировки. Нужен не ради порядка: постраничность у Google
+// обрывается примерно на 690 карточках, хотя счётчик обещает 2750. Каждая
+// сортировка показывает свои 690 из той же тысячи, и объединение проходов
+// достаёт то, до чего один проход не доходит. Первый проход - как открылось.
+const GOOGLE_SORTS = [
+  ['по релевантности', null],
+  ['по цене',          'По цене (в порядке возрастания)'],
+  ['по оценке',        'По оценке пользователей (в порядке убывания)'],
+  ['по отзывам',       'Наибольшее количество отзывов'],
+];
+const gSortsArg = args.find(a => a.startsWith('--google-sorts='));
+const GOOGLE_SORT_COUNT = gSortsArg
+  ? Math.max(1, Math.min(GOOGLE_SORTS.length, parseInt(gSortsArg.split('=')[1], 10) || 1))
+  : GOOGLE_SORTS.length;
+
+async function googleSortBy(page, label) {
+  const opener = page.locator('button', { hasText: 'Сортировка результатов' }).first();
+  if (!await opener.count()) return false;
+  await opener.click({ timeout: 15000 });
+  await wait(700);
+  const item = page.locator(`text="${label}"`).last();
+  if (!await item.count()) return false;
+  await item.click({ timeout: 15000 });
+  await wait(3000);
+  return true;
+}
+
+// Кнопка постраничности. Отличаем её от стрелок каруселей внутри карточек
+// (у тех тот же класс и тот же aria-label) по непустому тексту.
+async function googleClickNext(page) {
+  const btn = page.locator('button', { hasText: /^Далее$/ }).last();
+  if (!await btn.count()) return false;
+  if (await btn.isDisabled().catch(() => false)) return false;
+  await btn.click({ timeout: 15000 });
+  return true;
+}
+
+// ── Страница отеля: блок «Все варианты» ───────────────────────────────
+
+// Блоки AF_initDataCallback({key: 'ds:N', ..., data: [...], sideChannel: ...})
+// - это состояние страницы, отданное сервером вместе с HTML.
+function googleDsBlocks(html) {
+  const out = {};
+  const re = /AF_initDataCallback\(\{key: '(ds:\d+)'.*?data:(\[.*?\]), sideChannel/gs;
+  let m;
+  while ((m = re.exec(html))) {
+    try { out[m[1]] = JSON.parse(m[2]); } catch { /* блок не наш, пропускаем */ }
+  }
+  return out;
+}
+
+// Ищем узлы по форме, а не по фиксированному пути [0,6,2,21]: индексы
+// у Google меняются от сборки к сборке, а форма - нет. Предложение партнёра
+// узнаётся по тройке [название, id, "/travel/lodging/clk?..."] в голове.
+function googleFindOffers(root) {
+  let best = null;
+  const isOffer = n => Array.isArray(n) && Array.isArray(n[0])
+    && typeof n[0][0] === 'string'
+    && typeof n[0][2] === 'string' && n[0][2].includes('/travel/lodging/clk');
+  const walk = node => {
+    if (!Array.isArray(node)) return;
+    if (node.length && node.every(isOffer)) {
+      if (!best || node.length > best.length) best = node;
+      return;                       // внутрь найденного списка не лезем
+    }
+    for (const v of node) walk(v);
+  };
+  walk(root);
+  return best || [];
+}
+
+// Цена внутри предложения лежит пятёркой ["7 833 ₽", null, 7833.25, null, 7833].
+// Их две: за ночь и за всё проживание. Меньшая - за ночь.
+function googlePriceTuples(node, acc = []) {
+  if (!Array.isArray(node)) return acc;
+  if (typeof node[0] === 'string' && /\d\s*₽/.test(node[0]) && typeof node[2] === 'number') {
+    acc.push(Math.round(node[2]));
+    return acc;
+  }
+  for (const v of node) googlePriceTuples(v, acc);
+  return acc;
+}
+
+function googleParseEntity(html) {
+  const ds = googleDsBlocks(html);
+  // Блок отеля узнаём по форме: [0][1] - название, [0][2][0] - координаты.
+  // Предложений партнёров в нём может не быть совсем: на эти даты отель
+  // никто не продаёт. Это нормальный ответ, а не сбой разбора, поэтому
+  // выбираем блок по данным отеля, а не по наличию предложений - иначе
+  // теряются координаты и рейтинг, а с ними и отсев по расстоянию.
+  let data = null, offers = [];
+  for (const v of Object.values(ds)) {
+    if (typeof v?.[0]?.[1] !== 'string' || !Array.isArray(v?.[0]?.[2]?.[0])) continue;
+    const o = googleFindOffers(v);
+    if (!data || o.length > offers.length) { offers = o; data = v; }
+  }
+  if (!data) return null;
+
+  const flat = JSON.stringify(data);
+  const at = p => { let n = data; for (const i of p) { if (n == null) return null; n = n[i]; } return n; };
+
+  const parsed = offers.map(o => {
+    const prices = googlePriceTuples(o).filter(v => v >= 50 && v <= 5000000);
+    if (!prices.length) return null;
+    const perNight = Math.min(...prices);
+    const total = Math.max(...prices);
+    const clk = o[0][2] || '';
+    // В ссылке-редиректе настоящий адрес партнёра лежит в pcurl=
+    const pc = clk.match(/[?&]pcurl=([^&]+)/);
+    let partnerUrl = null;
+    if (pc) { try { partnerUrl = decodeURIComponent(pc[1]); } catch { partnerUrl = pc[1]; } }
+    return {
+      // Первой строкой Google ставит бронирование напрямую, и подписывает
+      // его названием отеля, а не словами. В таблице это выглядит как ещё
+      // один агрегатор, поэтому переименовываем.
+      partner: o[0][0] === at([0, 1]) ? 'Официальный сайт' : o[0][0],
+      per_night_rub: perNight,
+      total_rub: total > perNight ? total : perNight * nights,
+      url: partnerUrl || ('https://www.google.com' + clk),
+    };
+  }).filter(Boolean);
+
+  const rating = at([0, 7, 0]);
+  const coords = at([0, 2, 0]);
+  const stars = (flat.match(/"(\d) звезд[аы]?",\s*(\d)/) || [])[1];
+  return {
+    name: at([0, 1]),
+    lat: Array.isArray(coords) ? coords[0] : null,
+    lng: Array.isArray(coords) ? coords[1] : null,
+    address: at([0, 2, 1, 0, 0, 0]),
+    rating5: Array.isArray(rating) && typeof rating[0] === 'number' ? rating[0] : null,
+    reviews: Array.isArray(rating) && typeof rating[1] === 'number' ? rating[1] : null,
+    stars: stars ? parseInt(stars, 10) : null,
+    offers: parsed,
+  };
+}
+
+// Расстояние до центра города по прямой: у карточек Google его нет,
+// а планка «не дальше 8 км» без него не работает - половина «нячангских»
+// отелей стоит в Камрани за 20-35 км.
+function kmFromCenter(lat, lng) {
+  if (lat == null || lng == null || config.город.lat == null) return null;
+  const R = 6371, rad = d => d * Math.PI / 180;
+  const dLat = rad(lat - config.город.lat), dLng = rad(lng - config.город.lng);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(rad(config.город.lat)) * Math.cos(rad(lat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)) * 10) / 10;
+}
+
+// Название для сравнения между источниками. Слова, которые ничего не значат
+// («отель», «nha trang», «by», «the»), выбрасываем; «resort» и «condotel»
+// оставляем - они различают объекты: «Diamond Bay Hotel» в городе и
+// «Diamond Bay Resort & Spa» в Камрани это разные гостиницы.
+function normName(s) {
+  return (s || '').toLowerCase()
+    .replace(/\b(отель|hotel|spa|nha|trang|by|the|and|апарт|apartment)\b/g, ' ')
+    .replace(/[^a-zа-я0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+// Поиск отеля по названию. Даты тут не нужны и мешают: с параметром ts,
+// в котором зашит город, Google на запрос с именем отеля отвечает «Ничего
+// не найдено». Идентификатор отеля от дат не зависит, поэтому ищем без ts,
+// а цены потом берём страницей отеля уже с нашими датами.
+async function googleFindEntity(ctx, name) {
+  const q = `${name} ${config.город.query_trip}`;
+  const res = await ctx.request.get(
+    `https://www.google.com/travel/search?q=${encodeURIComponent(q)}&hl=ru&gl=ru&curr=RUB`,
+    { headers: { 'accept-language': 'ru-RU,ru;q=0.9' }, timeout: 45000 });
+  if (!res.ok()) throw new Error(`HTTP ${res.status()}`);
+  const html = await res.text();
+  // Первая ссылка не всегда верхний результат: рядом с карточкой Google
+  // рисует «похожие отели» с такими же data-href. Отдаём первые несколько,
+  // а выбирает вызывающий - по совпадению названия.
+  return [...new Set([...html.matchAll(/data-href="\/entity\/([A-Za-z0-9_-]+)"/g)]
+    .map(m => m[1]))].slice(0, 3);
+}
+
+async function googleFetchEntity(ctx, entityId, ts) {
+  const url = `https://www.google.com/travel/hotels/entity/${entityId}/prices`
+    + `?hl=ru&gl=ru&curr=RUB&ts=${ts}`;
+  const res = await ctx.request.get(url, {
+    headers: { 'accept-language': 'ru-RU,ru;q=0.9' }, timeout: 45000,
+  });
+  if (!res.ok()) throw new Error(`HTTP ${res.status()}`);
+  return googleParseEntity(await res.text());
 }
 
 async function scrapeGoogle(page) {
+  const ts = googleTs(checkin, checkout);
   const url = 'https://www.google.com/travel/search?'
     + `q=${encodeURIComponent('hotels ' + config.город.query_trip)}`
-    + `&hl=ru&gl=ru&curr=RUB&ts=${googleTs(checkin, checkout)}`;
+    + `&hl=ru&gl=ru&curr=RUB&ts=${ts}`;
   console.log('\n🌐  Google Hotels');
   console.log(`   ${url.slice(0, 96)}...`);
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -1130,67 +1387,203 @@ async function scrapeGoogle(page) {
   }).catch(() => ({}));
   console.log(`   даты на странице: ${shown.in} → ${shown.out}`);
 
+  // ── Проход 1: список, постранично, по каждой сортировке ──
   const bag = new Map();
-  let stale = 0;
-  for (let r = 1; r <= GOOGLE_MAX_ROUNDS; r++) {
-    await googleHarvest(page, bag);
-
-    const counter = await page.evaluate(() => {
-      const n = [...document.querySelectorAll('*')]
-        .find(e => !e.children.length && /Результаты\s*\d+[–-]\d+\s*из/.test(e.textContent || ''));
-      return n ? n.textContent.trim() : null;
-    }).catch(() => null);
-
-    const before = bag.size;
-    // Крутим колесом, а не скриптом: инъекция scrollTop у Google сбрасывает
-    // отрисовку списка, проверено - счётчик цен обнулялся.
-    await page.mouse.wheel(0, 4000);
-    await wait(900);
-    await googleHarvest(page, bag);
-
-    if (r % 5 === 0 || bag.size !== before) {
-      console.log(`   прокрутка ${r}: карточек ${bag.size}`
-        + (counter ? ` (${counter})` : ''));
+  const t0 = Date.now();
+  for (const [sortName, sortLabel] of GOOGLE_SORTS.slice(0, GOOGLE_SORT_COUNT)) {
+    const wasSize = bag.size;
+    console.log(`\n   ── сортировка ${sortName} ──`);
+    if (sortLabel) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await wait(3500);
+      let switched = false;
+      try { switched = await googleSortBy(page, sortLabel); }
+      catch (e) { console.log(`   ⚠️  ${e.message.split('\n')[0]}`); }
+      if (!switched) { console.log('   ⚠️  переключить сортировку не удалось, проход пропущен'); continue; }
     }
-    stale = bag.size === before ? stale + 1 : 0;
-    if (stale >= 6) { console.log('   ⏹  список перестал расти'); break; }
+
+    let stale = 0, prevCounter = null, page_ = 0;
+    for (page_ = 1; page_ <= GOOGLE_MAX_PAGES; page_++) {
+      const { seen, added } = await googleHarvest(page, bag);
+      const counter = await googleCounter(page);
+      console.log(`   стр. ${String(page_).padStart(3)}: на странице ${seen}, новых ${added},`
+        + ` всего ${bag.size}${counter ? ` (${counter})` : ''}`);
+
+      // Предохранитель: счётчик стоит и новых карточек нет - дальше некуда
+      if (!added && counter === prevCounter) {
+        if (++stale >= 2) { console.log('   ⏹  список перестал расти'); break; }
+      } else stale = 0;
+      prevCounter = counter;
+
+      let clicked = false;
+      try { clicked = await googleClickNext(page); }
+      catch (e) { console.log(`   ⏹  «Далее» не нажалась: ${e.message.split('\n')[0]}`); }
+      if (!clicked) { console.log('   ⏹  кнопки «Далее» больше нет — это последняя страница'); break; }
+
+      // Ждём, пока счётчик сменится: карточки перерисовываются с задержкой
+      // и без этой паузы следующий проход собрал бы ту же страницу.
+      for (let w = 0; w < 20; w++) {
+        await wait(400);
+        if (await googleCounter(page) !== counter) break;
+      }
+    }
+    if (page_ > GOOGLE_MAX_PAGES) {
+      console.log(`   ⚠️  упёрлись в предохранитель --google-pages=${GOOGLE_MAX_PAGES}`);
+    }
+    console.log(`   сортировка ${sortName} добавила ${bag.size - wasSize}, всего ${bag.size}`);
+  }
+  console.log(`\n✅ Google, список: карточек ${bag.size} за ${Math.round((Date.now() - t0) / 1000)} с`);
+
+  const cards = [...bag.values()];
+  const withId = cards.filter(c => c.entity_id);
+  console.log(`   с идентификатором отеля: ${withId.length}, без него: ${cards.length - withId.length}`);
+
+  // ── Проход 2: страница каждого отеля, блок «Все варианты» ──
+  const details = new Map();
+  if (GOOGLE_OFFERS && withId.length) {
+    const targets = GOOGLE_OFFERS_LIMIT ? withId.slice(0, GOOGLE_OFFERS_LIMIT) : withId;
+    console.log(`\n🔎  Google, варианты партнёров: ${targets.length} отелей,`
+      + ` по ${GOOGLE_CONCURRENCY} за раз`);
+    const t1 = Date.now();
+    let done = 0, failed = 0, offersTotal = 0;
+    for (let i = 0; i < targets.length; i += GOOGLE_CONCURRENCY) {
+      const chunk = targets.slice(i, i + GOOGLE_CONCURRENCY);
+      await Promise.all(chunk.map(async c => {
+        try {
+          const d = await googleFetchEntity(page.context(), c.entity_id, ts);
+          if (d) { details.set(c.entity_id, d); offersTotal += d.offers.length; }
+        } catch (e) {
+          failed++;
+          if (failed <= 5) console.log(`   ⚠️  ${c.name.slice(0, 40)}: ${e.message.split('\n')[0]}`);
+        }
+        done++;
+      }));
+      if (done % 50 < GOOGLE_CONCURRENCY || done === targets.length) {
+        const sec = (Date.now() - t1) / 1000;
+        console.log(`   ${String(done).padStart(4)}/${targets.length}`
+          + ` | предложений ${offersTotal} | ошибок ${failed}`
+          + ` | ${Math.round(sec)} с, ${(done / Math.max(sec, 1)).toFixed(1)}/с`);
+      }
+    }
+    console.log(`   готово: ${details.size} страниц, ${offersTotal} предложений,`
+      + ` ошибок ${failed}, ${Math.round((Date.now() - t1) / 1000)} с`);
   }
 
-  console.log(`\n✅ Google: карточек ${bag.size}`);
+  // ── Проход 3: отели соседних источников, которых нет в списке Google ──
+  if (GOOGLE_MATCH_FILE && GOOGLE_OFFERS && fs.existsSync(GOOGLE_MATCH_FILE)) {
+    const txt = fs.readFileSync(GOOGLE_MATCH_FILE, 'utf8').trim();
+    const prev = txt.startsWith('[') ? JSON.parse(txt)
+      : txt.split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const known = new Set(cards.map(c => normName(c.name)));
+    for (const d of details.values()) known.add(normName(d.name));
+    const wanted = new Map();
+    for (const h of prev) {
+      if (h.source === 'google' || !h.name || !h.price_total_rub) continue;
+      const k = normName(h.name);
+      if (k && !known.has(k) && !wanted.has(k)) wanted.set(k, h.name);
+    }
+    console.log(`\n🔗  Google, поимённый добор: в ${GOOGLE_MATCH_FILE}`
+      + ` отелей других источников без пары — ${wanted.size}`);
 
+    const names = [...wanted.values()];
+    const t2 = Date.now();
+    let found = 0, mism = 0, missed = 0, failed2 = 0, done2 = 0;
+    for (let i = 0; i < names.length; i += GOOGLE_CONCURRENCY) {
+      await Promise.all(names.slice(i, i + GOOGLE_CONCURRENCY).map(async nm => {
+        try {
+          const ids = await googleFindEntity(page.context(), nm);
+          if (!ids.length) { missed++; return; }
+          const a = normName(nm);
+          let hit = null;
+          for (const id of ids) {
+            if (details.has(id)) continue;          // уже взят под другим именем
+            const d = await googleFetchEntity(page.context(), id, ts);
+            if (!d) continue;
+            // Google охотно отвечает «похожим» отелем, поэтому сверяем имя
+            // из его же карточки: без этого в таблицу поедут чужие цены.
+            const b = normName(d.name);
+            if (a === b || (a.length >= 4 && b.includes(a)) || (b.length >= 4 && a.includes(b))) {
+              hit = { id, d };
+              break;
+            }
+          }
+          if (!hit) { mism++; return; }
+          details.set(hit.id, hit.d);
+          cards.push({
+            name: hit.d.name, entity_id: hit.id, per_night: null, total: null,
+            rating5: null, reviews: null, stars: null, deal: false, kind: null,
+            url: `https://www.google.com/travel/hotels/entity/${hit.id}/prices`
+              + `?hl=ru&gl=ru&curr=RUB&ts=${ts}`,
+            thumbnail: null,
+          });
+          found++;
+        } catch (e) {
+          failed2++;
+          if (failed2 <= 5) console.log(`   ⚠️  ${nm.slice(0, 40)}: ${e.message.split('\n')[0]}`);
+        }
+        done2++;
+      }));
+      if (done2 % 50 < GOOGLE_CONCURRENCY || done2 === names.length) {
+        console.log(`   ${String(done2).padStart(4)}/${names.length}`
+          + ` | добавлено ${found} | чужой отель ${mism} | не нашлось ${missed}`
+          + ` | ошибок ${failed2} | ${Math.round((Date.now() - t2) / 1000)} с`);
+      }
+    }
+    console.log(`   добор закончен: +${found} отелей, отклонено по несовпадению имени ${mism},`
+      + ` не нашлось ${missed}, ошибок ${failed2}`);
+  }
+
+  // ── Сохранение ──
   let saved = 0, noPrice = 0;
-  for (const c of bag.values()) {
-    if (c.per_night == null && c.total == null) { noPrice++; continue; }
-    const perNight = c.per_night != null
-      ? c.per_night : Math.round(c.total / nights);
-    const total = c.total != null ? c.total : perNight * nights;
+  for (const c of cards) {
+    const d = c.entity_id ? details.get(c.entity_id) : null;
+    const offers = d && d.offers.length ? d.offers : [];
+    const bestOffer = offers.length
+      ? offers.reduce((a, b) => (b.per_night_rub < a.per_night_rub ? b : a)) : null;
+
+    let perNight = bestOffer ? bestOffer.per_night_rub
+      : (c.per_night != null ? c.per_night
+        : (c.total != null ? Math.round(c.total / nights) : null));
+    if (perNight == null) { noPrice++; continue; }
     if (perNight < 100 || perNight > 5000000) { noPrice++; continue; }
+    const total = bestOffer ? bestOffer.total_rub
+      : (c.total != null ? c.total : perNight * nights);
+
+    const rating5 = d && d.rating5 != null ? d.rating5 : c.rating5;
+    const km = d ? kmFromCenter(d.lat, d.lng) : null;
 
     saveHotel({
       source: 'google',
-      name: c.name,
-      stars: c.stars,
+      name: (d && d.name) || c.name,
+      entity_id: c.entity_id,
+      stars: (d && d.stars) || c.stars,
       // Приводим пятибалльную шкалу Google к десятибалльной, как у соседей,
       // иначе 4,6 встанет в общий рейтинг ниже любой тройки с Booking.
-      rating: c.rating5 != null ? Math.round(c.rating5 * 2 * 100) / 100 : null,
-      rating_label: c.rating5 != null ? `${c.rating5} из 5` : null,
-      review_count: c.reviews,
+      rating: rating5 != null ? Math.round(rating5 * 2 * 100) / 100 : null,
+      rating_label: rating5 != null ? `${rating5} из 5` : null,
+      review_count: (d && d.reviews != null) ? d.reviews : c.reviews,
       price_display: `${perNight.toLocaleString('ru-RU')} ₽/ночь`,
       price_total_rub: total,
       price_per_night_rub: perNight,
       nights,
-      address: c.kind,
-      distance_text: null,
-      distance_center_km: null,
+      address: (d && d.address) || c.kind,
+      distance_text: km != null ? `${km} км от центра` : null,
+      distance_center_km: km,
       is_deal: c.deal,
-      lat: null,
-      lng: null,
+      lat: d ? d.lat : null,
+      lng: d ? d.lng : null,
       url: c.url,
       thumbnail: c.thumbnail,
+      // Ради этого всё и затевалось: у кого именно дешевле. Traveloka,
+      // klook, Prestigia и прочих не парсит ни один из остальных источников.
+      best_partner: bestOffer ? bestOffer.partner : null,
+      offers_count: offers.length,
+      offers,
     });
     saved++;
   }
-  console.log(`   сохранено ${saved}, без цены ${noPrice}`);
+  const withOffers = cards.filter(c => details.get(c.entity_id)?.offers.length).length;
+  console.log(`   сохранено ${saved}, без цены ${noPrice}, с вариантами партнёров ${withOffers}`);
   if (!saved) console.log('   ⚠️  цен не распознано — вёрстка могла поменяться');
 }
 
