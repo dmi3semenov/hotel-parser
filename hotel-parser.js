@@ -81,7 +81,12 @@ const { заезд: checkin, выезд: checkout } = config.даты;
 const nights = Math.round((new Date(checkout) - new Date(checkin)) / 86400000);
 
 // ── Output setup ──────────────────────────────────────────────────────
-const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
+// Секунды в метке обязательны. С точностью до минуты два прогона, запущенных
+// подряд, получают ОДНУ папку и дописываются в один hotels.jsonl: 15.08 так
+// сложились догоняющие прогоны Agoda по Гонконгу и по Гуанчжоу, и выгрузка
+// двух городов оказалась в одном файле. Повезло, что второй собрал ноль,
+// иначе города перемешались бы молча.
+const ts = new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-');
 const outDir = path.join('output', `run_${ts}`);
 fs.mkdirSync(outDir, { recursive: true });
 const checkpointFile = path.join(outDir, 'hotels.jsonl');
