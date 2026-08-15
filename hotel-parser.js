@@ -265,31 +265,64 @@ async function scrapeBooking(page) {
       const reviewMatch = (scoreEl?.parentElement?.textContent ?? '').match(/(\d[\d\s]*)\s*отзыв/i);
       const reviewCount = reviewMatch ? parseInt(reviewMatch[1].replace(/\s/g, '')) : null;
 
-      // Price — find ₽ in card text
+      // ── Цена ──────────────────────────────────────────────────────────
+      // Итог за все ночи лежит в отдельном узле:
+      //   <span data-testid="price-and-discounted-price">2 513 руб.</span>
+      // Строкой выше стоит «3 ночи, 2 взрослых» (`price-for-x-nights`), ниже —
+      // «Включая налоги и сборы» (`taxes-and-charges`). То есть узел — это
+      // цена за весь период на искомое число гостей, с налогами.
+      //
+      // Когда у отеля скидка, РЯДОМ лежит цена без скидки — зачёркнутая
+      // (`text-decoration: line-through`), и в тексте карточки она идёт ПЕРВОЙ:
+      //   «3 ночи, 2 взрослых5 026 руб.2 513 руб.Прежняя цена составляла…»
+      // Отсюда и брались завышенные цены: разбор по тексту карточки не
+      // различает зачёркнутое, поэтому берём узел, а не текст.
       const cardText = card.textContent;
-      // Booking показывает И цену за ночь («1 494 руб»), И итог («5 977 руб за 4 ночи»).
-      // Берём ИМЕННО итог за весь период — иначе код ещё раз делит на ночи и занижает в N раз.
-      // ВНИМАНИЕ: цены Booking завышены, причина не найдена. Сверка с ценами
-      // Booking, которые показывает по тем же отелям и датам Google, дала
-      // медиану отношения 1.67 при 62 совпадениях: по Larosa Hotel 16 431 ₽
-      // против 7 389 ₽, по Potique 41 581 ₽ против 29 920 ₽. У Agoda и
-      // Trip.com та же сверка даёт 1.07 и 0.99 - там всё верно.
-      // Проверенная и НЕ подтвердившаяся гипотеза: «в карточке два итога,
-      // перечёркнутый и настоящий, а match берёт первый». Итог в карточке
-      // один: выбор минимального из всех совпадений цену не изменил
-      // (Larosa как была 16 431 ₽, так и осталась). Копать дальше надо
-      // в тарифах: похоже, поиск Booking и фид Booking для Google отдают
-      // разные ставки. До выяснения столбец Booking считать завышенным.
-      const totalMatch = cardText.match(/([\d][\d\s]{2,}[\d])\s*руб\s*за\s+\d+\s+ноч/i);
-      let priceDisplay = totalMatch ? totalMatch[1].trim() + ' руб' : null;
-      if (!priceDisplay) {
-        // Фолбэк: максимальное число с руб/₽ в карточке (≥500) — обычно это итог,
-        // а не цена за ночь и не мелкие налоги/сборы.
-        const nums = [...cardText.matchAll(/([\d][\d\s]{2,}[\d])\s*(?:₽|руб)/gi)]
-          .map(m => parseInt(m[1].replace(/\s/g, ''), 10))
-          .filter(n => !isNaN(n) && n >= 500);
-        if (nums.length) priceDisplay = Math.max(...nums) + ' руб';
+      const priceNum = (s, min) => {
+        const m = (s || '').match(/([\d][\d\s]*\d)\s*(?:руб|₽)/i);
+        if (!m) return null;
+        const n = parseInt(m[1].replace(/\s/g, ''), 10);
+        return isNaN(n) || n < min ? null : n;
+      };
+
+      // Листовые узлы с ценой и признаком «зачёркнута». getComputedStyle
+      // считается один раз на узел с «руб» — по всем узлам карточки это сотни
+      // пересчётов стиля на карточку и заметная задержка на всей выдаче.
+      const priceLeaves = [...card.querySelectorAll('*')]
+        .filter(el => !el.children.length && /руб|₽/.test(el.textContent || ''))
+        .map(el => ({ el, text: el.textContent,
+                      struck: getComputedStyle(el).textDecorationLine === 'line-through' }));
+
+      let priceRub = null, priceFrom = null;
+      // 1. Узел итога. В карточке он один, но при нескольких вариантах
+      //    размещения берём минимальный — как и остальные источники, которые
+      //    отдают самое дешёвое предложение на эти даты.
+      const totals = [...card.querySelectorAll('[data-testid="price-and-discounted-price"]')]
+        .map(el => priceNum(el.textContent, 100)).filter(Boolean);
+      if (totals.length) { priceRub = Math.min(...totals); priceFrom = 'узел итога'; }
+      // 2. Резерв на переименование testid: строка для скринридера
+      //    «Прежняя цена составляла X руб.. Текущая цена составляет Y руб.».
+      if (priceRub === null) {
+        const cur = [...cardText.matchAll(/Текущая цена составляет\s*([\d][\d\s]*\d)\s*руб/gi)]
+          .map(m => parseInt(m[1].replace(/\s/g, ''), 10)).filter(n => !isNaN(n));
+        if (cur.length) { priceRub = Math.min(...cur); priceFrom = 'строка скринридера'; }
       }
+      // 3. Последний резерв — цены из НЕзачёркнутых узлов, минимальная из них.
+      //    Максимум брать нельзя: это и есть цена до скидки.
+      if (priceRub === null) {
+        const alive = priceLeaves
+          .filter(l => !l.struck && !/налог|сбор|%/i.test(l.text))
+          .map(l => priceNum(l.text, 500)).filter(Boolean);
+        if (alive.length) { priceRub = Math.min(...alive); priceFrom = 'незачёркнутые узлы'; }
+      }
+      const priceDisplay = priceRub === null ? null
+        : priceRub.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ' руб.';
+      // Зачёркнутая цена идёт не в выгрузку, а в лог прогона: по ней видно,
+      // сколько накручивал прежний разбор, и заметно, если Booking снова
+      // поменяет вёрстку.
+      const struckPrices = priceLeaves.filter(l => l.struck)
+        .map(l => priceNum(l.text, 100)).filter(Boolean);
+      const strikeRub = struckPrices.length ? Math.max(...struckPrices) : null;
 
       // Stars
       const starsMatch = (card.querySelector('[aria-label*="звёзд"]')?.getAttribute('aria-label') ??
@@ -314,7 +347,8 @@ async function scrapeBooking(page) {
                   card.querySelector('img')?.src ?? null;
 
       return { name, rating, rating_label: ratingLabel, review_count: reviewCount,
-               price_display: priceDisplay, stars, address, distance_text: distanceText,
+               price_display: priceDisplay, price_rub: priceRub, price_from: priceFrom,
+               price_strike: strikeRub, stars, address, distance_text: distanceText,
                lat, lng, url, thumbnail: img };
     }).filter(Boolean);
   });
@@ -324,8 +358,26 @@ async function scrapeBooking(page) {
     console.log('⚠️  Нет результатов. Скриншот: ' + path.join(outDir, 'booking_screenshot.png'));
   }
 
+  // Чем снята цена — в лог каждого прогона. Прежний разбор молча деградировал
+  // до фолбэка, когда Booking перестал писать «N руб за 3 ночи», и полтора
+  // месяца отдавал цену до скидки. Печатаем стратегию, чтобы такое было видно
+  // сразу, а не через сверку с Google.
+  const byFrom = {};
+  for (const h of raw) byFrom[h.price_from ?? 'цены нет'] = (byFrom[h.price_from ?? 'цены нет'] ?? 0) + 1;
+  console.log(`   цена снята: ${Object.entries(byFrom).map(([k, v]) => `${k} — ${v}`).join(', ')}`);
+  if (raw.length && !byFrom['узел итога']) {
+    console.log('⚠️  Ни одной цены из [data-testid="price-and-discounted-price"] — '
+              + 'похоже, Booking переименовал узел. Проверьте разбор, прежде чем верить цифрам.');
+  }
+  const disc = raw.filter(h => h.price_strike && h.price_rub && h.price_strike > h.price_rub)
+                  .map(h => h.price_strike / h.price_rub).sort((a, b) => a - b);
+  if (disc.length) {
+    console.log(`   скидка показана у ${disc.length} из ${raw.length} карточек, `
+              + `медиана «цена до скидки / настоящая» ${disc[Math.floor(disc.length / 2)].toFixed(2)}x`);
+  }
+
   for (const h of raw) {
-    const totalRub = parsePriceRub(h.price_display);
+    const totalRub = h.price_rub ?? parsePriceRub(h.price_display);
     saveHotel({
       source: 'booking',
       name: h.name,
