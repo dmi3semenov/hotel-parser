@@ -7,6 +7,8 @@
     "parse": "node hotel-parser.js",
     "parse:booking": "node hotel-parser.js --booking",
     "parse:trip": "node hotel-parser.js --trip",
+    "parse:ostrovok": "node hotel-parser.js --ostrovok",
+    "parse:agoda": "node hotel-parser.js --agoda",
     "report": "node build-report.js"
   },
   "dependencies": {
