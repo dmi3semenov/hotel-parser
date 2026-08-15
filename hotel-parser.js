@@ -52,6 +52,18 @@ const GOOGLE_MATCH_FILE = args.includes('--google-no-match') ? null
 const pagesArg = args.find(a => a.startsWith('--agoda-pages='));
 const AGODA_MAX_PAGES = pagesArg ? (parseInt(pagesArg.split('=')[1], 10) || 0) : 0;
 
+// Прокрутка выдачи Agoda. Доля экрана — единственная величина здесь, от
+// которой зависит полнота сбора: она обязана быть МЕНЬШЕ единицы, иначе
+// между кадрами остаётся слепая полоса. Почему это ломает выгрузку —
+// подробно у agodaHarvestVisible. Остальные три числа — предохранители от
+// бесконечного цикла, а не потолок выгрузки: страница останавливает сбор
+// сама, когда перестаёт расти.
+const AGODA_STEP_RATIO = 0.8;
+const AGODA_SCROLL_PAUSE = 1200;
+const AGODA_STALE_STOP = 4;
+const AGODA_MAX_STEPS = 250;
+const AGODA_PAGE_BUDGET_MS = 180000;
+
 // Островок: по 20 карточек на страницу, листается кнопкой «Вперед».
 // По умолчанию идём до конца — цикл сам остановится, когда кнопка «Вперед»
 // пропадёт. 200 здесь не потолок выгрузки, а предохранитель от бесконечного
@@ -796,25 +808,34 @@ function agodaExtract() {
     const name = t('[data-selenium="hotel-name"]');
     if (!name) return null;
 
-    // display-price — чистое число, hotel-currency — символ отдельным узлом
-    let price = num(t('[data-element-name="display-price"]'));
-    if (price === null) price = num(t('[data-element-name="final-price"]'));
-    if (price === null) {
-      price = num(q('[data-element-name="fpc-room-price"]')?.getAttribute('data-fpc-value'));
-    }
-
-    // Подпись сама говорит, за что цена («За ночь после налогов и сборов»).
-    // Читаем её, а не предполагаем период.
-    const priceLabel = t('[data-element-name="per-night-begins-with"]');
-
     // Agoda метит узлы то data-selenium, то data-element-name, то data-testid —
-    // причём один и тот же по смыслу блок в разных карточках по-разному.
+    // причём один и тот же по смыслу блок в разных карточках по-разному, а
+    // у одного и того же узла семейство атрибута со временем меняется.
     // Ищем по значению во всех трёх: иначе половина полей молча пустая
     // (так рейтинг, звёзды и отзывы приходили null у всех 575 отелей).
     const byName = v => n.querySelector(`[data-selenium="${v}"]`)
                      || n.querySelector(`[data-element-name="${v}"]`)
                      || n.querySelector(`[data-testid="${v}"]`);
     const tn = v => byName(v)?.textContent?.trim() || null;
+
+    // Цена — только именованный узел; регэксп по тексту карточки брать
+    // НЕЛЬЗЯ (первым в блоке идёт бейдж «С учетом 2 751 ₽» — это размер
+    // скидки, а fpc-cor-price — зачёркнутая цена до скидки).
+    // 15.08.2026 Agoda перенесла цену из data-element-name в data-selenium:
+    // display-price, hotel-currency и per-night-begins-with под старым
+    // атрибутом не находятся уже ни в одной карточке. Цена держалась на
+    // запасном final-price, а валюта и подпись периода молча стали null —
+    // ровно тот тихий отказ, ради которого byName и заведён. Число берём
+    // как есть: узел отдаёт то «19 850», то «₽21 189».
+    let price = num(tn('display-price'));
+    if (price === null) price = num(tn('final-price'));
+    if (price === null) {
+      price = num(byName('fpc-room-price')?.getAttribute('data-fpc-value'));
+    }
+
+    // Подпись сама говорит, за что цена («За ночь после налогов и сборов»).
+    // Читаем её, а не предполагаем период.
+    const priceLabel = tn('per-night-begins-with');
 
     // «Количество звезд: 5 из 5»
     const starM = (tn('ssr-property-card-star-rating') || '')
@@ -833,7 +854,7 @@ function agodaExtract() {
       hotel_id: n.getAttribute('data-hotelid') || null,
       name,
       price,
-      currency: t('[data-element-name="hotel-currency"]'),
+      currency: tn('hotel-currency'),
       price_label: priceLabel,
       stars:   starM ? parseFloat(starM[1].replace(',', '.')) : null,
       rating:  rateM ? parseFloat(rateM[1].replace(',', '.')) : null,
@@ -916,10 +937,32 @@ async function scrapeAgoda(page) {
   return await harvestAgoda(page);
 }
 
-// Собираем ПО ХОДУ скролла, а не один раз в конце. Agoda дорисовывает
-// карточки и цены только когда они попадают в зону видимости
-// (div[data-testid="lazy-load-component"].LazyLoad.is-visible) — поэтому
-// единственный проход в конце оставлял большинство карточек без цены.
+// Собираем ПО ХОДУ прокрутки, а не один раз в конце: Agoda дорисовывает и
+// карточки, и цены только по факту попадания в зону видимости.
+//
+// Списком правит react-lazyload. Очередная порция карточек висит на
+// «сентинеле» — пустом div[data-testid="lazy-load-component"] НУЛЕВОЙ
+// высоты. Порция монтируется, только когда сентинел побывал в зоне
+// видимости, и вешает следующий сентинел ниже себя. Отсюда три правила,
+// каждое снято с живой выдачи Нячанга 15.08.2026, а не выведено умозрительно.
+//
+// 1. Шаг прокрутки ОБЯЗАН быть меньше экрана. Прежние 1,5 экрана оставляли
+//    между двумя кадрами слепую полосу в пол-экрана. Сентинел нулевой
+//    высоты, попавший в неё, не пересекается с вьюпортом никогда — цепочка
+//    не стартует, и страница навсегда остаётся с теми 11 карточками, что
+//    пришли с сервера. Замер: шаг 1,5 экрана — 11 карточек и lazy 0/8 на
+//    каждом шаге; шаг 0,8 экрана — первый сентинел срабатывает на первом же
+//    шаге, дальше 45 карточек, дальше 90. Отсюда и брались 92 отеля вместо
+//    368: 11 страниц по 8-9 карточек.
+// 2. Стоянием на месте не догрузить ничего. 45 секунд внизу страницы не
+//    добавили ни одной карточки: список растёт только под прокруткой.
+// 3. Заканчивать прыжком scrollTo(scrollHeight) нельзя — это ровно тот
+//    слепой прыжок, который сбор и ломает.
+//
+// Останавливаемся не по числу шагов, а по факту: доехали до низа И ни
+// карточек, ни высоты страницы не прибавилось несколько шагов подряд.
+// Высоту смотрим наравне с карточками, потому что порция сначала занимает
+// место и только потом наполняется ценами.
 async function agodaHarvestVisible(page, bag) {
   const absorb = list => {
     for (const c of list) {
@@ -930,17 +973,54 @@ async function agodaHarvestVisible(page, bag) {
     }
   };
 
-  let lastCount = -1, stale = 0;
-  for (let step = 0; step < 45 && stale < 4; step++) {
+  // Страница после клика по пагинации и так приходит наверх, но начинать
+  // проход из известной точки дешевле, чем полагаться на это.
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await wait(1200);
+
+  const t0 = Date.now();
+  let stale = 0, prevSize = -1, prevHeight = -1, steps = 0, onPage = 0;
+  let stop = 'страница перестала расти';
+
+  for (; steps < AGODA_MAX_STEPS; steps++) {
     const batch = await page.evaluate(agodaExtract).catch(() => []);
+    onPage = Math.max(onPage, batch.length);
     absorb(batch);
-    if (batch.length === lastCount) stale++; else { stale = 0; lastCount = batch.length; }
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5));
-    await wait(1300);
+
+    const geo = await page.evaluate(() => ({
+      height: document.body.scrollHeight,
+      y: Math.round(window.scrollY),
+      view: window.innerHeight,
+    })).catch(() => null);
+    if (!geo) { stop = 'страница не ответила'; break; }
+
+    const atBottom = geo.y + geo.view >= geo.height - 8;
+    if (bag.size !== prevSize || geo.height !== prevHeight) {
+      stale = 0; prevSize = bag.size; prevHeight = geo.height;
+    } else if (atBottom) {
+      stale++;                    // и не растём, и ехать дальше некуда
+    }
+    if (stale >= AGODA_STALE_STOP) break;
+
+    if (Date.now() - t0 > AGODA_PAGE_BUDGET_MS) {
+      stop = `бюджет ${Math.round(AGODA_PAGE_BUDGET_MS / 1000)} с исчерпан`;
+      break;
+    }
+
+    await page.evaluate(r => window.scrollBy(0, Math.round(window.innerHeight * r)),
+      AGODA_STEP_RATIO);
+    await wait(AGODA_SCROLL_PAUSE);
   }
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await wait(2500);
-  absorb(await page.evaluate(agodaExtract).catch(() => []));
+  if (steps >= AGODA_MAX_STEPS) stop = `предохранитель ${AGODA_MAX_STEPS} шагов`;
+
+  // Последние карточки монтируются раньше, чем в них приезжает цена, а
+  // цена уже не двигает ни счётчик, ни высоту и потому не сбрасывает
+  // счётчик простоя. Один добор после выхода из цикла их и подбирает.
+  const tail = await page.evaluate(agodaExtract).catch(() => []);
+  onPage = Math.max(onPage, tail.length);
+  absorb(tail);
+
+  return { steps, sec: Math.round((Date.now() - t0) / 1000), height: prevHeight, stop, onPage };
 }
 
 // Выдача разбита на страницы («Стр. 1 из 10») — скроллом они не добираются
@@ -982,9 +1062,24 @@ async function harvestAgoda(page) {
     }
     console.log(`📄 Agoda, страница ${p}${label ? ` (${label.trim()})` : ''}...`);
 
-    await agodaHarvestVisible(page, bag);
+    const before = bag.size;
+    const r = await agodaHarvestVisible(page, bag);
+    const got = bag.size - before;
     const withPrice = [...bag.values()].filter(c => c.price != null).length;
+    console.log(`   на странице ${r.onPage}, из них новых ${got}`
+      + ` — ${r.steps} шагов / ${r.sec} с, высота ${r.height} px, стоп: ${r.stop}`);
     console.log(`   собрано ${bag.size}, из них с ценой ${withPrice}`);
+
+    // Тихий недобор — та самая поломка, из-за которой выгрузка съехала с 368
+    // до 92 и никто этого не заметил: страниц столько же, а карточек втрое
+    // меньше. Пусть кричит в лог, а не выясняется через месяц по отчёту.
+    // Считаем именно карточки НА СТРАНИЦЕ, а не новые: на последних страницах
+    // Agoda повторяет уже показанное, и по приросту это неотличимо от поломки
+    // (страница 11 Нячанга: 6 новых при полусотне карточек в DOM).
+    if (r.onPage < 15) {
+      console.log(`   ⚠️  на странице всего ${r.onPage} карточек — похоже, ленивая`
+        + ` подгрузка не стартовала (ждём десятки, а не единицы)`);
+    }
 
     if (p >= limit) {
       console.log(AGODA_MAX_PAGES
