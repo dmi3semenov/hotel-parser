@@ -41,11 +41,16 @@ const gConcArg = args.find(a => a.startsWith('--google-concurrency='));
 const GOOGLE_CONCURRENCY = gConcArg ? parseInt(gConcArg.split('=')[1], 10) || 5 : 5;
 
 // Третий проход: отели, которые нашли остальные четыре источника, а в списке
-// Google их нет. Их ищем поимённо. Файл - выгрузка с другими источниками,
-// по умолчанию output/latest.json, который парсер сам и пишет.
+// Google их нет. Их ищем поимённо. Файл - выгрузка с другими источниками.
+//
+// При полном прогоне это чекпоинт ТЕКУЩЕГО прогона: Google идёт последним,
+// остальные четыре источника к тому моменту в него уже дописались. Раньше
+// по умолчанию брался output/latest.json, а в нём при смене города лежит
+// ПРОШЛЫЙ город - парсер честно шёл искать в Дананге нячангские отели.
+// При запуске одного источника latest.json как раз то, что нужно: там
+// соседи с прошлого прогона по этому же городу.
+// Значение считается ниже, после того как определён checkpointFile.
 const gMatchArg = args.find(a => a.startsWith('--google-match='));
-const GOOGLE_MATCH_FILE = args.includes('--google-no-match') ? null
-  : (gMatchArg ? gMatchArg.split('=')[1] : path.join('output', 'latest.json'));
 
 // Сколько страниц выдачи проходить. Без флага число берётся со страницы
 // («Стр. 1 из 10»), а не зашивается: для другого города оно другое.
@@ -80,6 +85,10 @@ const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', 
 const outDir = path.join('output', `run_${ts}`);
 fs.mkdirSync(outDir, { recursive: true });
 const checkpointFile = path.join(outDir, 'hotels.jsonl');
+
+const GOOGLE_MATCH_FILE = args.includes('--google-no-match') ? null
+  : (gMatchArg ? gMatchArg.split('=')[1]
+    : (runAll ? checkpointFile : path.join('output', 'latest.json')));
 
 function saveHotel(hotel) {
   fs.appendFileSync(checkpointFile, JSON.stringify(hotel) + '\n');
