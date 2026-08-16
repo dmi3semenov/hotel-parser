@@ -1215,9 +1215,9 @@ async function harvestAgoda(page) {
 //
 // 1. Даты и город. Google игнорирует checkin/checkout в ссылке - он держит
 //    их в параметре ts, это protobuf в base64url, и там же лежит МЕСТО.
-//    Собирать ts с нуля нельзя, сервер отвечает 500. Рабочий приём: взять
-//    живой ts и подменить в нём байты дат. Живой ts берём у самого Google -
-//    подробности у GOOGLE_TS_FALLBACK ниже.
+//    Собираем ts сами: идентификатор города берём из HTML выдачи, форму -
+//    ту, которую строит клиент Google (проверена побайтно). Подробности
+//    у googleCityPlace() и googleBuildTs() ниже.
 // 2. Постраничность есть, но невидимая. Внизу списка написано «Результаты
 //    1-18 из 1091» и рядом стоит кнопка «Далее» БЕЗ подписи: текст лежит
 //    внутри span, а сама кнопка неотличима от стрелок каруселей внутри
@@ -1233,7 +1233,7 @@ async function harvestAgoda(page) {
 //    не требуется, поэтому карточку отеля берём обычным ctx.request.get
 //    за полторы секунды вместо пяти на рендер.
 
-// Аварийный запас на случай, если снять живой ts со страницы не удалось.
+// Аварийный запас на случай, если город не достался ни одним заходом.
 // В нём зашит НЯЧАНГ (место /m/044cjv, имя «Nha Trang») и заезд 17 августа,
 // выезд 21 августа, 4 ночи. По другим городам он работает только потому, что
 // q перебивает место из ts: 15.08.2026 по Дананту и Гонконгу так и приехали
@@ -1244,13 +1244,9 @@ const GOOGLE_TS_FALLBACK =
 
 // Дата внутри ts - подсообщение {1: год, 2: месяц, 3: день}, в байтах это
 // 08 <год, два байта> 10 <месяц> 18 <день>, следом 18 <число ночей> у родителя.
-// Ищем по этой форме, а не по зашитой строке с августом 2026: у снятого
-// у Google ts свои даты, и фиксированный маркер в нём не найдётся.
-// Длины при подмене не меняются - год 2020-2100 всегда занимает два байта,
-// месяц, день и число ночей по одному, - поэтому внутренние префиксы длин
-// остаются валидными и пересобирать protobuf не приходится.
-function googleTs(ts, ci, co) {
-  const raw = Buffer.from(ts.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+// Ищем по этой форме, а не по зашитой строке с августом 2026: у чужого ts
+// свои даты, и фиксированный маркер в нём не найдётся.
+function googleTsDateSpots(raw) {
   const spots = [];
   for (let i = 0; i + 6 < raw.length; i++) {
     if (raw[i] !== 0x08 || !(raw[i + 1] & 0x80) || (raw[i + 2] & 0x80)) continue;
@@ -1260,6 +1256,26 @@ function googleTs(ts, ci, co) {
     if (raw[i + 5] !== 0x18 || raw[i + 6] < 1 || raw[i + 6] > 31) continue;
     spots.push(i);
   }
+  return spots;
+}
+
+const pad2 = n => String(n).padStart(2, '0');
+
+// Даты обратно из готового ts - проверять свою же сборку тем разбором,
+// которым читаем чужие.
+function googleTsDates(ts) {
+  const raw = Buffer.from(ts.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  return googleTsDateSpots(raw).map(i =>
+    `${(raw[i + 1] & 0x7f) | (raw[i + 2] << 7)}-${pad2(raw[i + 4])}-${pad2(raw[i + 6])}`);
+}
+
+// Подмена дат в готовом ts - нужна только запасному шаблону: свой ts мы
+// собираем сразу с нужными датами. Длины при подмене не меняются - год
+// 2020-2100 всегда занимает два байта, месяц, день и число ночей по одному, -
+// поэтому внутренние префиксы длин остаются валидными.
+function googleTs(ts, ci, co) {
+  const raw = Buffer.from(ts.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  const spots = googleTsDateSpots(raw);
   if (spots.length !== 2) throw new Error(`дат в ts найдено: ${spots.length}, а нужно две`);
   const d1 = new Date(ci), d2 = new Date(co);
   const put = (at, d) => {
@@ -1322,10 +1338,100 @@ function googleTsPlace(ts) {
     && !/^0x[0-9a-f]+:0x[0-9a-f]+$/i.test(t) && !/^\/[a-z]\//.test(t)) || null;
 }
 
-// Живой ts берём у самого Google: открываем выдачу по городу БЕЗ ts, и клиент
-// строит его сам - с нужным местом и своими датами по умолчанию (завтра плюс
-// ночь). В ответе сервера параметра ещё нет, его дорисовывает скрипт страницы,
-// поэтому снимаем из DOM после рендера, а не из тела ответа.
+// ── Место города и сборка ts ──────────────────────────────────────────────
+//
+// Идентификатор города лежит в HTML выдачи, до всякого JS, в одной из двух
+// форм - какая достанется, зависит от города:
+//
+//   [null,"Да Нанг","0x314219c792252a13:0x1df0cb4b86727e06"]      FID
+//   ["/m/044cjv","Nha Trang", …                                   mid
+//
+// Дананг, Гонконг и Гуанчжоу отдают FID, Нячанг, Тбилиси и Минск - mid.
+// Обе формы ts принимает, разница только в номере поля внутри.
+const GOOGLE_PLACE_FID = /\[null,"([^"\\]{2,60})","(0x[0-9a-f]{6,16}:0x[0-9a-f]{6,16})"\]/g;
+const GOOGLE_PLACE_MID = /\["(\/m\/[0-9a-z_]{4,12})","([^"\\]{2,60})"/g;
+
+async function googleCityPlace(ctx, city) {
+  const url = `https://www.google.com/travel/search?q=${encodeURIComponent('hotels ' + city)}`
+    + '&hl=ru&gl=ru&curr=RUB';
+  const res = await ctx.request.get(url, {
+    headers: { 'accept-language': 'ru-RU,ru;q=0.9' }, timeout: 45000,
+  });
+  if (!res.ok()) throw new Error(`HTTP ${res.status()}`);
+  const html = await res.text();
+  const counts = new Map();
+  const add = (ident, name) => {
+    const k = `${ident}\u0000${name}`;
+    counts.set(k, (counts.get(k) || 0) + 1);
+  };
+  for (const m of html.matchAll(GOOGLE_PLACE_FID)) add(m[2], m[1]);
+  for (const m of html.matchAll(GOOGLE_PLACE_MID)) add(m[1], m[2]);
+  if (!counts.size) throw new Error('в выдаче не нашлось ни одного места');
+  // Город страница поминает два десятка раз, чужие места - районы, соседние
+  // провинции, отели - единицами. Замер по шести городам: разрыв не меньше
+  // семикратного, поэтому берём самый частый и требуем хотя бы пять.
+  const [best, hits] = [...counts].sort((a, b) => b[1] - a[1])[0];
+  const [ident, name] = best.split('\u0000');
+  if (hits < 5) throw new Error(`место «${name}» встретилось ${hits} раз - это не город выдачи`);
+  return { ident, name, hits };
+}
+
+// Сборка protobuf. Форма снята со страницы 16.08.2026 и проверена побайтно:
+// собранный ts совпадает с тем, что строит клиент Google. Прежняя запись
+// «собрать ts с нуля нельзя, сервер отвечает 500» была про угаданную форму -
+// в ней место клали в поле mid и без соседних настроек.
+function pbVarint(n) {
+  const out = [];
+  for (;;) {
+    const b = n & 0x7f;
+    n >>>= 7;
+    out.push(b | (n ? 0x80 : 0));
+    if (!n) return Buffer.from(out);
+  }
+}
+const pbTag = (field, wire) => pbVarint((field << 3) | wire);
+const pbVal = (field, n) => Buffer.concat([pbTag(field, 0), pbVarint(n)]);
+const pbMsg = (field, payload) =>
+  Buffer.concat([pbTag(field, 2), pbVarint(payload.length), payload]);
+const pbDate = d => Buffer.concat([
+  pbVal(1, d.getUTCFullYear()), pbVal(2, d.getUTCMonth() + 1), pbVal(3, d.getUTCDate()),
+]);
+
+function googleBuildTs(ident, name, ci, co, currency = 'RUB') {
+  const d1 = new Date(ci), d2 = new Date(co);
+  // Идентификатор бывает двух видов, и лежат они в разных полях одного
+  // и того же подсообщения: mid в первом, FID в шестом.
+  const place = pbMsg(1, pbMsg(2, Buffer.concat([
+    pbMsg(ident.startsWith('/') ? 1 : 6, Buffer.from(ident)), pbMsg(7, Buffer.from(name)),
+  ])));
+  const stay = pbMsg(2, Buffer.concat([
+    pbMsg(2, Buffer.concat([
+      pbMsg(1, pbDate(d1)), pbMsg(2, pbDate(d2)),
+      pbVal(3, Math.round((d2 - d1) / 86400000)),
+    ])),
+    pbMsg(6, pbVal(2, 0)),
+  ]));
+  const blob = Buffer.concat([
+    pbVal(1, 1),
+    pbMsg(2, Buffer.concat([pbMsg(1, pbVal(1, 3)), pbMsg(1, pbVal(1, 3)), pbVal(2, 0)])),
+    pbMsg(3, Buffer.concat([place, stay])),
+    pbMsg(5, pbMsg(1, pbMsg(7, Buffer.from(currency)))),
+  ]);
+  const ts = blob.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // Свою же сборку читаем обратно: молча кривой ts выглядит как «Google
+  // почему-то отдал не те даты», и разбираться в этом потом дорого.
+  const back = googleTsDates(ts).join(' ');
+  const want = `${ci} ${co}`;
+  if (back !== want) throw new Error(`собранный ts читается как «${back}», а не «${want}»`);
+  return ts;
+}
+
+// Запасной путь, если идентификатор из HTML не достался: открыть выдачу БЕЗ ts
+// и снять готовый ts из DOM - его строит клиент Google, с нужным местом и
+// своими датами по умолчанию (завтра плюс ночь). В теле ответа параметра нет,
+// его дорисовывает скрипт страницы, поэтому и нужен рендер. Механизм от
+// разбора HTML независим и переживает то, от чего ломается googleCityPlace(),
+// но стоит загрузки страницы и пяти секунд ожидания.
 async function googleGrabTs(page, city) {
   const url = `https://www.google.com/travel/search?q=${encodeURIComponent('hotels ' + city)}`
     + '&hl=ru&gl=ru&curr=RUB';
@@ -1623,23 +1729,37 @@ async function googleFetchEntity(ctx, entityId, ts) {
 async function scrapeGoogle(page) {
   console.log('\n🌐  Google Hotels');
 
-  // ts города - у самого Google, даты - свои. Запасной шаблон нячангский,
-  // и на нём q и ts говорят про разные города, поэтому о переходе на него
+  // ts города - у самого Google, даты - свои. Три захода, от дешёвого
+  // к дорогому: идентификатор из HTML (один GET), готовый ts из DOM
+  // (загрузка страницы плюс пять секунд), зашитый шаблон. Шаблон нячангский,
+  // на нём q и ts говорят про разные города, поэтому о переходе на него
   // прогон обязан сказать вслух, а не тихо продолжить.
   const t0ts = Date.now();
+  const sec = () => `${((Date.now() - t0ts) / 1000).toFixed(1)} с`;
   let ts = null;
-  const live = await googleGrabTs(page, config.город.query_trip);
-  if (live) {
-    try { ts = googleTs(live, checkin, checkout); }
-    catch (e) { console.log(`   ⚠️  снятый ts не поддался подмене дат: ${e.message}`); }
+  try {
+    const place = await googleCityPlace(page.context(), config.город.query_trip);
+    ts = googleBuildTs(place.ident, place.name, checkin, checkout);
+    console.log(`   ts собран по месту из выдачи за ${sec()}:`
+      + ` «${place.name}», ${place.ident}, упоминаний в HTML ${place.hits}`);
+  } catch (e) {
+    console.log(`   ⚠️  место из HTML не достал (${e.message.split('\n')[0]}),`
+      + ' захожу за готовым ts на страницу');
+    const live = await googleGrabTs(page, config.город.query_trip);
+    if (live) {
+      try { ts = googleTs(live, checkin, checkout); }
+      catch (e2) { console.log(`   ⚠️  снятый ts не поддался подмене дат: ${e2.message}`); }
+    }
+    if (ts) {
+      console.log(`   ts снят со страницы города за ${sec()},`
+        + ` место в нём — «${googleTsPlace(ts) || 'не разобрано'}»`);
+    }
   }
-  if (ts) {
-    console.log(`   ts снят со страницы города за ${Math.round((Date.now() - t0ts) / 1000)} с,`
-      + ` место в нём — «${googleTsPlace(ts) || 'не разобрано'}»`);
-  } else {
+  if (!ts) {
     ts = googleTs(GOOGLE_TS_FALLBACK, checkin, checkout);
-    console.log(`   ⚠️  ts со страницы не снялся — иду на зашитом шаблоне,`
-      + ` место в нём «${googleTsPlace(ts) || 'не разобрано'}», а не ${config.город.query_trip}.`
+    console.log('   ⚠️  город у Google не достался ни одним способом — иду на зашитом'
+      + ` шаблоне, место в нём «${googleTsPlace(ts) || 'не разобрано'}»,`
+      + ` а не ${config.город.query_trip}.`
       + ' Список спасёт только то, что q перебивает место из ts;'
       + ' цены на страницах отелей от места в ts не зависят.');
   }
