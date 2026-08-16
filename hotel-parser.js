@@ -94,6 +94,10 @@ const checkpointFile = path.join(outDir, 'hotels.jsonl');
 const GOOGLE_MATCH_FILE = args.includes('--google-no-match') ? null
   : (gMatchArg ? gMatchArg.split('=')[1]
     : (runAll ? checkpointFile : path.join('output', 'latest.json')));
+// Насколько далеко от центра города может стоять отель, найденный поимённым
+// добором. Планка отсекает не пригороды, а другие страны - см. проверку по
+// координатам в конце scrapeGoogle().
+const GOOGLE_MATCH_MAX_KM = 150;
 
 function saveHotel(hotel) {
   fs.appendFileSync(checkpointFile, JSON.stringify(hotel) + '\n');
@@ -1209,11 +1213,11 @@ async function harvestAgoda(page) {
 //
 // Три особенности, из-за которых модуль не похож на соседние.
 //
-// 1. Даты. Google игнорирует checkin/checkout в ссылке - он держит их
-//    в параметре ts, это protobuf в base64url. Собирать его с нуля нельзя,
-//    сервер отвечает 500. Рабочий приём: взять живой шаблон и подменить
-//    в нём байты дней и число ночей. Длины при этом не меняются, поэтому
-//    внутренние префиксы длин остаются валидными.
+// 1. Даты и город. Google игнорирует checkin/checkout в ссылке - он держит
+//    их в параметре ts, это protobuf в base64url, и там же лежит МЕСТО.
+//    Собирать ts с нуля нельзя, сервер отвечает 500. Рабочий приём: взять
+//    живой ts и подменить в нём байты дат. Живой ts берём у самого Google -
+//    подробности у GOOGLE_TS_FALLBACK ниже.
 // 2. Постраничность есть, но невидимая. Внизу списка написано «Результаты
 //    1-18 из 1091» и рядом стоит кнопка «Далее» БЕЗ подписи: текст лежит
 //    внутри span, а сама кнопка неотличима от стрелок каруселей внутри
@@ -1229,29 +1233,117 @@ async function harvestAgoda(page) {
 //    не требуется, поэтому карточку отеля берём обычным ctx.request.get
 //    за полторы секунды вместо пяти на рендер.
 
-const GOOGLE_TS_TEMPLATE =
+// Аварийный запас на случай, если снять живой ts со страницы не удалось.
+// В нём зашит НЯЧАНГ (место /m/044cjv, имя «Nha Trang») и заезд 17 августа,
+// выезд 21 августа, 4 ночи. По другим городам он работает только потому, что
+// q перебивает место из ts: 15.08.2026 по Дананту и Гонконгу так и приехали
+// правильные адреса. Но это везение, а не договор - при q с названием отеля
+// и ts с городом Google уже отвечал «Ничего не найдено».
+const GOOGLE_TS_FALLBACK =
   'CAEaOAoaEhYKCS9tLzA0NGNqdjoJTmhhIFRyYW5nGgASGhIUCgcI6g8QCBgREgcI6g8QCBgVGAQyAggBKgkKBToDUlVCGgA';
-// в шаблоне зашиты заезд 17 августа, выезд 21 августа и 4 ночи
-const GOOGLE_DATE_MARK = Buffer.from('08ea0f100818', 'hex');   // {2026, 8, день}
 
-function googleTs(ci, co) {
-  const raw = Buffer.from(GOOGLE_TS_TEMPLATE.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+// Дата внутри ts - подсообщение {1: год, 2: месяц, 3: день}, в байтах это
+// 08 <год, два байта> 10 <месяц> 18 <день>, следом 18 <число ночей> у родителя.
+// Ищем по этой форме, а не по зашитой строке с августом 2026: у снятого
+// у Google ts свои даты, и фиксированный маркер в нём не найдётся.
+// Длины при подмене не меняются - год 2020-2100 всегда занимает два байта,
+// месяц, день и число ночей по одному, - поэтому внутренние префиксы длин
+// остаются валидными и пересобирать protobuf не приходится.
+function googleTs(ts, ci, co) {
+  const raw = Buffer.from(ts.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
   const spots = [];
-  let from = 0;
-  for (;;) {
-    const i = raw.indexOf(GOOGLE_DATE_MARK, from);
-    if (i === -1) break;
-    spots.push(i + GOOGLE_DATE_MARK.length);
-    from = i + 1;
+  for (let i = 0; i + 6 < raw.length; i++) {
+    if (raw[i] !== 0x08 || !(raw[i + 1] & 0x80) || (raw[i + 2] & 0x80)) continue;
+    const year = (raw[i + 1] & 0x7f) | (raw[i + 2] << 7);
+    if (year < 2020 || year > 2100) continue;
+    if (raw[i + 3] !== 0x10 || raw[i + 4] < 1 || raw[i + 4] > 12) continue;
+    if (raw[i + 5] !== 0x18 || raw[i + 6] < 1 || raw[i + 6] > 31) continue;
+    spots.push(i);
   }
-  if (spots.length !== 2) throw new Error(`в шаблоне ts найдено дат: ${spots.length}`);
+  if (spots.length !== 2) throw new Error(`дат в ts найдено: ${spots.length}, а нужно две`);
   const d1 = new Date(ci), d2 = new Date(co);
-  raw[spots[0]] = d1.getUTCDate();
-  raw[spots[1]] = d2.getUTCDate();
-  if (raw[spots[1] + 1] === 0x18) {
-    raw[spots[1] + 2] = Math.round((d2 - d1) / 86400000);
-  }
+  const put = (at, d) => {
+    const y = d.getUTCFullYear();
+    raw[at + 1] = (y & 0x7f) | 0x80;
+    raw[at + 2] = y >> 7;
+    raw[at + 4] = d.getUTCMonth() + 1;
+    raw[at + 6] = d.getUTCDate();
+  };
+  put(spots[0], d1);
+  put(spots[1], d2);
+  const nightCount = Math.round((d2 - d1) / 86400000);
+  // Ночей больше 127 одним байтом не записать, а менять длину нельзя.
+  if (nightCount > 127) throw new Error(`ночей ${nightCount}: в ts влезает не больше 127`);
+  if (raw[spots[1] + 7] === 0x18) raw[spots[1] + 8] = nightCount;
   return raw.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Название места из ts - строкой, для лога. Единственное место, где видно,
+// какой город Google положил в запрос: ошибись он - и цены приедут чужие.
+//
+// Внутри protobuf строка и вложенное сообщение выглядят одинаково, и «на глаз»
+// их не различить: подсообщение с идентификатором места начинается с байтов
+// 32 25, а это печатные «2%», и целиком читается как «2%0x3142…:Да Нанг».
+// Поэтому решаем разбором: сначала пробуем прочитать кусок как сообщение, и
+// строкой считаем только то, что сообщением не читается.
+function googleTsStrings(buf, out = []) {
+  let i = 0;
+  while (i < buf.length) {
+    const wire = buf[i++] & 7;
+    if (wire === 0) {                                // varint
+      while (i < buf.length && (buf[i] & 0x80)) i++;
+      if (i++ >= buf.length) return null;
+      continue;
+    }
+    if (wire !== 2) return null;                     // других типов в ts не встречалось
+    let len = 0, shift = 0;
+    while (i < buf.length && (buf[i] & 0x80)) { len |= (buf[i++] & 0x7f) << shift; shift += 7; }
+    if (i >= buf.length) return null;
+    len |= (buf[i++] & 0x7f) << shift;
+    if (i + len > buf.length) return null;           // длина врёт - это не сообщение
+    const sub = buf.slice(i, i + len);
+    i += len;
+    if (!len) continue;
+    const inner = googleTsStrings(sub, []);
+    if (inner) out.push(...inner);
+    else out.push(sub.toString('utf8'));
+  }
+  return out;
+}
+
+function googleTsPlace(ts) {
+  let texts;
+  try { texts = googleTsStrings(Buffer.from(ts.replace(/-/g, '+').replace(/_/g, '/'), 'base64')); }
+  catch { return null; }
+  if (!texts) return null;
+  // Кроме имени в ts лежат валюта и идентификатор места - в двух видах:
+  // старый mid «/m/044cjv» и нынешний FID «0x3142…:0x1df0…».
+  return texts.find(t => t !== 'RUB'
+    && !/^0x[0-9a-f]+:0x[0-9a-f]+$/i.test(t) && !/^\/[a-z]\//.test(t)) || null;
+}
+
+// Живой ts берём у самого Google: открываем выдачу по городу БЕЗ ts, и клиент
+// строит его сам - с нужным местом и своими датами по умолчанию (завтра плюс
+// ночь). В ответе сервера параметра ещё нет, его дорисовывает скрипт страницы,
+// поэтому снимаем из DOM после рендера, а не из тела ответа.
+async function googleGrabTs(page, city) {
+  const url = `https://www.google.com/travel/search?q=${encodeURIComponent('hotels ' + city)}`
+    + '&hl=ru&gl=ru&curr=RUB';
+  // Ни одна ошибка здесь не должна ронять источник: не снялось - идём
+  // на запасном шаблоне, как ходили до 16.08.2026.
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); }
+  catch (e) { console.log(`   ⚠️  страница города не открылась: ${e.message.split('\n')[0]}`); return null; }
+  await wait(5000);
+  return page.evaluate(() => {
+    const seen = new Map();
+    for (const m of document.documentElement.outerHTML.matchAll(/[?&;]ts=([A-Za-z0-9_%-]+)/g)) {
+      const t = decodeURIComponent(m[1]);
+      seen.set(t, (seen.get(t) || 0) + 1);
+    }
+    // Самый частый: у Google он один на всю страницу (замер по Дананту -
+    // 136 вхождений одного значения), редкий - точно не про нашу выдачу.
+    return [...seen].sort((a, b) => b[1] - a[1]).map(([t]) => t)[0] || null;
+  }).catch(() => null);
 }
 
 function googleExtract() {
@@ -1529,11 +1621,32 @@ async function googleFetchEntity(ctx, entityId, ts) {
 }
 
 async function scrapeGoogle(page) {
-  const ts = googleTs(checkin, checkout);
+  console.log('\n🌐  Google Hotels');
+
+  // ts города - у самого Google, даты - свои. Запасной шаблон нячангский,
+  // и на нём q и ts говорят про разные города, поэтому о переходе на него
+  // прогон обязан сказать вслух, а не тихо продолжить.
+  const t0ts = Date.now();
+  let ts = null;
+  const live = await googleGrabTs(page, config.город.query_trip);
+  if (live) {
+    try { ts = googleTs(live, checkin, checkout); }
+    catch (e) { console.log(`   ⚠️  снятый ts не поддался подмене дат: ${e.message}`); }
+  }
+  if (ts) {
+    console.log(`   ts снят со страницы города за ${Math.round((Date.now() - t0ts) / 1000)} с,`
+      + ` место в нём — «${googleTsPlace(ts) || 'не разобрано'}»`);
+  } else {
+    ts = googleTs(GOOGLE_TS_FALLBACK, checkin, checkout);
+    console.log(`   ⚠️  ts со страницы не снялся — иду на зашитом шаблоне,`
+      + ` место в нём «${googleTsPlace(ts) || 'не разобрано'}», а не ${config.город.query_trip}.`
+      + ' Список спасёт только то, что q перебивает место из ts;'
+      + ' цены на страницах отелей от места в ts не зависят.');
+  }
+
   const url = 'https://www.google.com/travel/search?'
     + `q=${encodeURIComponent('hotels ' + config.город.query_trip)}`
     + `&hl=ru&gl=ru&curr=RUB&ts=${ts}`;
-  console.log('\n🌐  Google Hotels');
   console.log(`   ${url.slice(0, 96)}...`);
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await wait(3500);
@@ -1548,6 +1661,16 @@ async function scrapeGoogle(page) {
     return { in: v('Заезд'), out: v('Выезд') };
   }).catch(() => ({}));
   console.log(`   даты на странице: ${shown.in} → ${shown.out}`);
+  // Сверяем числами: «чт, 10 сент.» против 10-го из конфига. Месяц не берём -
+  // сокращения у Google свои, а день ловит подмену дат целиком.
+  const dayOf = s => { const m = String(s || '').match(/(\d{1,2})/); return m ? +m[1] : null; };
+  if (shown.in == null || shown.out == null) {
+    console.log('   ⚠️  полей с датами на странице нет — проверить нечем, вёрстка могла поменяться');
+  } else if (dayOf(shown.in) !== new Date(checkin).getUTCDate()
+    || dayOf(shown.out) !== new Date(checkout).getUTCDate()) {
+    console.log(`   ⚠️  на странице НЕ наши даты (просили ${checkin} → ${checkout})`
+      + ' — цены будут за чужие ночи');
+  }
 
   // ── Проход 1: список, постранично, по каждой сортировке ──
   const bag = new Map();
@@ -1649,7 +1772,8 @@ async function scrapeGoogle(page) {
 
     const names = [...wanted.values()];
     const t2 = Date.now();
-    let found = 0, mism = 0, missed = 0, failed2 = 0, done2 = 0;
+    let found = 0, mism = 0, missed = 0, failed2 = 0, done2 = 0, far = 0;
+    const farExamples = [];
     for (let i = 0; i < names.length; i += GOOGLE_CONCURRENCY) {
       await Promise.all(names.slice(i, i + GOOGLE_CONCURRENCY).map(async nm => {
         // Считаем в начале, а не в конце: ниже три ранних return, и после
@@ -1661,7 +1785,7 @@ async function scrapeGoogle(page) {
           const ids = await googleFindEntity(page.context(), nm);
           if (!ids.length) { missed++; return; }
           const a = normName(nm);
-          let hit = null;
+          let hit = null, farHere = 0;
           for (const id of ids) {
             if (details.has(id)) continue;          // уже взят под другим именем
             const d = await googleFetchEntity(page.context(), id, ts);
@@ -1669,12 +1793,24 @@ async function scrapeGoogle(page) {
             // Google охотно отвечает «похожим» отелем, поэтому сверяем имя
             // из его же карточки: без этого в таблицу поедут чужие цены.
             const b = normName(d.name);
-            if (a === b || (a.length >= 4 && b.includes(a)) || (b.length >= 4 && a.includes(b))) {
-              hit = { id, d };
-              break;
+            if (!(a === b || (a.length >= 4 && b.includes(a)) || (b.length >= 4 && a.includes(b)))) continue;
+            // Совпадения имени мало: сети носят одно имя в разных городах,
+            // а короткое имя попадает внутрь чужого. По Гуанчжоу «James Joyce
+            // Coffetel» нашёлся пекинским (1861 км, имя совпало буква в букву),
+            // по Дананту «Dubai Hotel» - дубайским Indigo (5567 км, «dubai»
+            // оказалось куском чужого названия). Планка щедрая: Google считает
+            // Данангом и Тамки в сотне километров, и это настоящие отели.
+            const km = kmFromCenter(d.lat, d.lng);
+            if (km != null && km > GOOGLE_MATCH_MAX_KM) {
+              farHere++;
+              if (farExamples.length < 5) farExamples.push(`${nm} → ${d.name} (${km} км)`);
+              continue;
             }
+            hit = { id, d };
+            break;
           }
-          if (!hit) { mism++; return; }
+          // Имя считаем один раз: либо не совпало, либо совпало, но не в этом городе.
+          if (!hit) { if (farHere) far++; else mism++; return; }
           details.set(hit.id, hit.d);
           cards.push({
             name: hit.d.name, entity_id: hit.id, per_night: null, total: null,
@@ -1691,12 +1827,14 @@ async function scrapeGoogle(page) {
       }));
       if (done2 % 50 < GOOGLE_CONCURRENCY || done2 === names.length) {
         console.log(`   ${String(done2).padStart(4)}/${names.length}`
-          + ` | добавлено ${found} | чужой отель ${mism} | не нашлось ${missed}`
-          + ` | ошибок ${failed2} | ${Math.round((Date.now() - t2) / 1000)} с`);
+          + ` | добавлено ${found} | чужой отель ${mism} | чужой город ${far}`
+          + ` | не нашлось ${missed} | ошибок ${failed2}`
+          + ` | ${Math.round((Date.now() - t2) / 1000)} с`);
       }
     }
     console.log(`   добор закончен: +${found} отелей, отклонено по несовпадению имени ${mism},`
-      + ` не нашлось ${missed}, ошибок ${failed2}`);
+      + ` по расстоянию от центра ${far}, не нашлось ${missed}, ошибок ${failed2}`);
+    for (const ex of farExamples) console.log(`   ↳ дальше ${GOOGLE_MATCH_MAX_KM} км: ${ex}`);
   }
 
   // ── Сохранение ──
