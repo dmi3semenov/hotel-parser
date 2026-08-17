@@ -6,6 +6,41 @@ const path = require('path');
 
 const config = JSON.parse(fs.readFileSync('hotel-config.json', 'utf8'));
 const args = process.argv.slice(2);
+
+// ── Город и даты из репозитория ───────────────────────────────────────
+// Блок города дорого собирать заново: внутренние id Trip.com и Agoda нигде
+// в открытом виде не лежат, их смотрят в адресной строке после ручного
+// поиска города на каждом сайте. Каталоги прогонов копию конфига не хранят,
+// поэтому 17.08.2026 конфиг Дананга пришлось восстанавливать по ссылкам
+// в старой выгрузке. Теперь готовые блоки лежат в cities/ и подставляются
+// флагом:
+//
+//     node hotel-parser.js --city=danang --ci=2026-08-21 --co=2026-08-26
+//
+// Без флага берётся то, что в hotel-config.json лежит сейчас.
+const flag = (name) => {
+  const a = args.find((x) => x.startsWith(`--${name}=`));
+  return a ? a.split('=').slice(1).join('=') : null;
+};
+const cityArg = flag('city');
+if (cityArg) {
+  const file = path.join(__dirname, 'cities', `${cityArg}.json`);
+  if (!fs.existsSync(file)) {
+    const have = fs.readdirSync(path.join(__dirname, 'cities'))
+      .filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', ''));
+    console.error(`Города «${cityArg}» в cities/ нет. Есть: ${have.join(', ')}`);
+    process.exit(1);
+  }
+  config.город = JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+if (flag('ci')) config.даты.заезд = flag('ci');
+if (flag('co')) config.даты.выезд = flag('co');
+if (cityArg || flag('ci') || flag('co')) {
+  // Пишем обратно: build-report.js и trip-years.js читают тот же файл,
+  // и расходиться с прогоном он не должен.
+  fs.writeFileSync('hotel-config.json', JSON.stringify(config));
+}
+
 const ONLY_BOOKING  = args.includes('--booking');
 const ONLY_TRIP     = args.includes('--trip');
 const ONLY_OSTROVOK = args.includes('--ostrovok');
