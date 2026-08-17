@@ -1,0 +1,14 @@
+{
+  "название": "Дананг",
+  "страна": "Вьетнам",
+  "query_booking": "Дананг",
+  "query_trip": "Da Nang",
+  "cityid_trip": 1356,
+  "lat": 16.0684,
+  "lng": 108.224,
+  "slug": "da-nang",
+  "slug_ostrovok": "da_nang2",
+  "country_ostrovok": "vietnam",
+  "geocode_countrycodes": "vn",
+  "cityid_agoda": 16440
+}

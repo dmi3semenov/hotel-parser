@@ -1,0 +1,14 @@
+{
+  "название": "Гуанчжоу",
+  "страна": "Китай",
+  "query_booking": "Аэропорт Гуанчжоу Байюнь",
+  "query_trip": "Guangzhou",
+  "cityid_trip": 32,
+  "lat": 23.3863,
+  "lng": 113.3023,
+  "slug": "guangzhou",
+  "slug_ostrovok": "guangzhou",
+  "country_ostrovok": "china",
+  "geocode_countrycodes": "cn",
+  "cityid_agoda": 10112
+}
