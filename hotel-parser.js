@@ -2061,7 +2061,7 @@ async function main() {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'ru-RU',
   });
-  const page = await ctx.newPage();
+  let page = await ctx.newPage();
 
   try {
     // Каждый источник в своём try: раньше падение одного обрывало весь прогон,
@@ -2078,14 +2078,33 @@ async function main() {
       try {
         await fn(page);
       } catch (e) {
-        if (e.message.includes('closed')) throw e;
         console.error(`\n⚠️  ${label} не отработал: ${e.message.split('\n')[0]}`);
+        // Умершая вкладка больше не повод бросать прогон. 22.08.2026 Booking
+        // закрыл страницу на клике по баннеру кук, и вместе с ней уходили
+        // Agoda с Google - те самые 753 и 685 отелей, ради которых всё
+        // и затевается. Живой контекст переживает смерть вкладки: открываем
+        // новую и идём дальше.
+        if (page.isClosed() || e.message.includes('closed')) {
+          if (ctx.pages().length === 0 && !page.isClosed()) throw e;
+          try {
+            page = await ctx.newPage();
+            console.error('   Вкладка умерла, открыл новую.');
+          } catch (fatal) {
+            console.error('   Контекст тоже мёртв, дальше идти некуда.');
+            throw fatal;
+          }
+        }
         console.error('   Иду к следующему источнику.\n');
       }
     }
   } catch (err) {
     if (err.message.includes('closed')) {
-      console.error('\n❌ Браузер был закрыт вручную. Запустите снова.');
+      // Раньше здесь стояло только «закрыт вручную», и 22.08.2026 это дважды
+      // увело диагностику не туда: браузер был жив, слово closed приехало из
+      // совсем другой ошибки Playwright. Печатаем настоящий текст и стек.
+      console.error('\n❌ Похоже, браузер или страница закрылись. Настоящая ошибка:');
+      console.error('   ' + err.message.split('\n')[0]);
+      console.error((err.stack || '').split('\n').slice(1, 4).join('\n'));
     } else {
       console.error('\n❌ Ошибка парсинга:', err.message);
     }

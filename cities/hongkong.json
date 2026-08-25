@@ -1,0 +1,14 @@
+{
+  "название": "Гонконг",
+  "страна": "Китай",
+  "query_booking": "Гонконг",
+  "query_trip": "Hong Kong",
+  "cityid_trip": 58,
+  "lat": 22.2988,
+  "lng": 114.1722,
+  "slug": "hong-kong",
+  "slug_ostrovok": "hong_kong_hong_kong_vicinity",
+  "country_ostrovok": "china",
+  "geocode_countrycodes": "hk",
+  "cityid_agoda": 16808
+}
